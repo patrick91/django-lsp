@@ -558,44 +558,53 @@ fn module_name_from_path(root: &Path, path: &Path) -> String {
 fn collect_imports(module_name: &str, is_package: bool, body: &[Stmt]) -> HashMap<String, String> {
     let mut imports = HashMap::new();
     for statement in body {
-        match statement {
-            Stmt::Import(import_stmt) => {
-                for alias in &import_stmt.names {
-                    let local_name = alias
-                        .asname
-                        .as_ref()
-                        .map(|asname| asname.id.clone())
-                        .unwrap_or_else(|| alias.name.id.split('.').next().unwrap_or(alias.name.as_str()).to_string());
-                    imports.insert(local_name, alias.name.id.clone());
-                }
-            }
-            Stmt::ImportFrom(import_from) => {
-                let Some(module) = resolve_import_module(
-                    module_name,
-                    is_package,
-                    import_from.level,
-                    import_from.module.as_ref().map(|module| module.as_str()),
-                ) else {
-                    continue;
-                };
-
-                for alias in &import_from.names {
-                    if alias.name.as_str() == "*" {
-                        continue;
-                    }
-
-                    let local_name = alias
-                        .asname
-                        .as_ref()
-                        .map(|asname| asname.id.clone())
-                        .unwrap_or_else(|| alias.name.id.clone());
-                    imports.insert(local_name, format!("{module}.{}", alias.name.id));
-                }
-            }
-            _ => {}
-        }
+        apply_import_statement(statement, module_name, is_package, &mut imports);
     }
     imports
+}
+
+fn apply_import_statement(
+    statement: &Stmt,
+    module_name: &str,
+    is_package: bool,
+    imports: &mut HashMap<String, String>,
+) {
+    match statement {
+        Stmt::Import(import_stmt) => {
+            for alias in &import_stmt.names {
+                let local_name = alias
+                    .asname
+                    .as_ref()
+                    .map(|asname| asname.id.clone())
+                    .unwrap_or_else(|| alias.name.id.split('.').next().unwrap_or(alias.name.as_str()).to_string());
+                imports.insert(local_name, alias.name.id.clone());
+            }
+        }
+        Stmt::ImportFrom(import_from) => {
+            let Some(module) = resolve_import_module(
+                module_name,
+                is_package,
+                import_from.level,
+                import_from.module.as_ref().map(|module| module.as_str()),
+            ) else {
+                return;
+            };
+
+            for alias in &import_from.names {
+                if alias.name.as_str() == "*" {
+                    continue;
+                }
+
+                let local_name = alias
+                    .asname
+                    .as_ref()
+                    .map(|asname| asname.id.clone())
+                    .unwrap_or_else(|| alias.name.id.clone());
+                imports.insert(local_name, format!("{module}.{}", alias.name.id));
+            }
+        }
+        _ => {}
+    }
 }
 
 fn resolve_import_module(module_name: &str, is_package: bool, level: u32, imported_module: Option<&str>) -> Option<String> {
@@ -957,14 +966,11 @@ pub fn infer_model_for_expression(
     local_bindings: &HashMap<String, ModelId>,
 ) -> Option<ModelId> {
     match expr {
-        Expr::Name(name) => local_bindings
-            .get(name.id.as_str())
-            .cloned()
-            .or_else(|| index.resolve_model_symbol(module_name, name.id.as_str()))
-            .or_else(|| imports.get(name.id.as_str()).and_then(|qualified| index.resolve_qualified_model(qualified))),
+        Expr::Name(_) => resolve_model_reference_expr(expr, index, module_name, imports, local_bindings),
         Expr::Attribute(attribute) if attribute.attr.as_str() == "objects" => {
             infer_model_for_expression(&attribute.value, index, module_name, imports, local_bindings)
         }
+        Expr::Attribute(_) => resolve_model_reference_expr(expr, index, module_name, imports, local_bindings),
         Expr::Call(call) => {
             let method = match call.func.as_ref() {
                 Expr::Attribute(attribute) => attribute,
@@ -981,12 +987,34 @@ pub fn infer_model_for_expression(
     }
 }
 
-pub fn collect_visible_bindings(
+fn resolve_model_reference_expr(
+    expr: &Expr,
+    index: &WorkspaceIndex,
+    module_name: &str,
+    imports: &HashMap<String, String>,
+    local_bindings: &HashMap<String, ModelId>,
+) -> Option<ModelId> {
+    match expr {
+        Expr::Name(name) => local_bindings
+            .get(name.id.as_str())
+            .cloned()
+            .or_else(|| index.resolve_model_symbol(module_name, name.id.as_str()))
+            .or_else(|| imports.get(name.id.as_str()).and_then(|qualified| index.resolve_qualified_model(qualified))),
+        Expr::Attribute(_) => {
+            let qualified = qualify_expr(expr, module_name, &HashSet::new(), imports)?;
+            index.resolve_qualified_model(&qualified)
+        }
+        _ => None,
+    }
+}
+
+pub fn collect_visible_scope(
     body: &[Stmt],
     cursor_offset: usize,
     index: &WorkspaceIndex,
     module_name: &str,
-    imports: &HashMap<String, String>,
+    is_package: bool,
+    imports: &mut HashMap<String, String>,
     bindings: &mut HashMap<String, ModelId>,
 ) {
     let cursor = TextSize::try_from(cursor_offset).unwrap_or(TextSize::from(u32::MAX));
@@ -994,19 +1022,23 @@ pub fn collect_visible_bindings(
         if statement.range().start() > cursor {
             break;
         }
-        collect_bindings_from_statement(statement, cursor, index, module_name, imports, bindings);
+        collect_scope_from_statement(statement, cursor, index, module_name, is_package, imports, bindings);
     }
 }
 
-fn collect_bindings_from_statement(
+fn collect_scope_from_statement(
     statement: &Stmt,
     cursor: TextSize,
     index: &WorkspaceIndex,
     module_name: &str,
-    imports: &HashMap<String, String>,
+    is_package: bool,
+    imports: &mut HashMap<String, String>,
     bindings: &mut HashMap<String, ModelId>,
 ) {
     match statement {
+        Stmt::Import(_) | Stmt::ImportFrom(_) if statement.range().end() <= cursor => {
+            apply_import_statement(statement, module_name, is_package, imports);
+        }
         Stmt::Assign(assign) if assign.range.end() <= cursor => {
             if assign.targets.len() == 1 {
                 if let Expr::Name(name) = &assign.targets[0] {
@@ -1026,33 +1058,129 @@ fn collect_bindings_from_statement(
             }
         }
         Stmt::If(if_stmt) => {
-            collect_visible_bindings(&if_stmt.body, cursor.to_usize(), index, module_name, imports, bindings);
+            collect_visible_scope(
+                &if_stmt.body,
+                cursor.to_usize(),
+                index,
+                module_name,
+                is_package,
+                imports,
+                bindings,
+            );
             for clause in &if_stmt.elif_else_clauses {
-                collect_visible_bindings(&clause.body, cursor.to_usize(), index, module_name, imports, bindings);
+                collect_visible_scope(
+                    &clause.body,
+                    cursor.to_usize(),
+                    index,
+                    module_name,
+                    is_package,
+                    imports,
+                    bindings,
+                );
             }
         }
         Stmt::For(for_stmt) => {
-            collect_visible_bindings(&for_stmt.body, cursor.to_usize(), index, module_name, imports, bindings);
-            collect_visible_bindings(&for_stmt.orelse, cursor.to_usize(), index, module_name, imports, bindings);
+            collect_visible_scope(
+                &for_stmt.body,
+                cursor.to_usize(),
+                index,
+                module_name,
+                is_package,
+                imports,
+                bindings,
+            );
+            collect_visible_scope(
+                &for_stmt.orelse,
+                cursor.to_usize(),
+                index,
+                module_name,
+                is_package,
+                imports,
+                bindings,
+            );
         }
         Stmt::While(while_stmt) => {
-            collect_visible_bindings(&while_stmt.body, cursor.to_usize(), index, module_name, imports, bindings);
-            collect_visible_bindings(&while_stmt.orelse, cursor.to_usize(), index, module_name, imports, bindings);
+            collect_visible_scope(
+                &while_stmt.body,
+                cursor.to_usize(),
+                index,
+                module_name,
+                is_package,
+                imports,
+                bindings,
+            );
+            collect_visible_scope(
+                &while_stmt.orelse,
+                cursor.to_usize(),
+                index,
+                module_name,
+                is_package,
+                imports,
+                bindings,
+            );
         }
         Stmt::With(with_stmt) => {
-            collect_visible_bindings(&with_stmt.body, cursor.to_usize(), index, module_name, imports, bindings);
+            collect_visible_scope(
+                &with_stmt.body,
+                cursor.to_usize(),
+                index,
+                module_name,
+                is_package,
+                imports,
+                bindings,
+            );
         }
         Stmt::Try(try_stmt) => {
-            collect_visible_bindings(&try_stmt.body, cursor.to_usize(), index, module_name, imports, bindings);
-            collect_visible_bindings(&try_stmt.orelse, cursor.to_usize(), index, module_name, imports, bindings);
-            collect_visible_bindings(&try_stmt.finalbody, cursor.to_usize(), index, module_name, imports, bindings);
+            collect_visible_scope(
+                &try_stmt.body,
+                cursor.to_usize(),
+                index,
+                module_name,
+                is_package,
+                imports,
+                bindings,
+            );
+            collect_visible_scope(
+                &try_stmt.orelse,
+                cursor.to_usize(),
+                index,
+                module_name,
+                is_package,
+                imports,
+                bindings,
+            );
+            collect_visible_scope(
+                &try_stmt.finalbody,
+                cursor.to_usize(),
+                index,
+                module_name,
+                is_package,
+                imports,
+                bindings,
+            );
             for handler in &try_stmt.handlers {
                 let ast::ExceptHandler::ExceptHandler(handler) = handler;
-                collect_visible_bindings(&handler.body, cursor.to_usize(), index, module_name, imports, bindings);
+                collect_visible_scope(
+                    &handler.body,
+                    cursor.to_usize(),
+                    index,
+                    module_name,
+                    is_package,
+                    imports,
+                    bindings,
+                );
             }
         }
         Stmt::FunctionDef(function_def) if function_def.range.contains_inclusive(cursor) => {
-            collect_visible_bindings(&function_def.body, cursor.to_usize(), index, module_name, imports, bindings);
+            collect_visible_scope(
+                &function_def.body,
+                cursor.to_usize(),
+                index,
+                module_name,
+                is_package,
+                imports,
+                bindings,
+            );
         }
         _ => {}
     }

@@ -5,7 +5,7 @@ use ruff_python_parser::parse_expression;
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, CompletionTextEdit, Range, TextEdit};
 
 use crate::index::{
-    analyze_source, collect_visible_bindings, infer_model_for_expression, FieldInfo, ModelId, WorkspaceIndex,
+    analyze_source, collect_visible_scope, infer_model_for_expression, FieldInfo, ModelId, WorkspaceIndex,
 };
 
 const QUERY_METHODS: &[&str] = &["filter", "exclude", "get"];
@@ -44,13 +44,15 @@ pub fn complete(
     }
 
     let analysis = analyze_source(index.root(), path, source);
+    let mut imports = analysis.imports.clone();
     let mut bindings = HashMap::new();
-    collect_visible_bindings(
+    collect_visible_scope(
         &analysis.body,
         cursor_offset,
         index,
         &analysis.module_name,
-        &analysis.imports,
+        analysis.is_package,
+        &mut imports,
         &mut bindings,
     );
 
@@ -62,7 +64,7 @@ pub fn complete(
         &parsed.syntax().body,
         index,
         &analysis.module_name,
-        &analysis.imports,
+        &imports,
         &bindings,
     ) else {
         return Vec::new();
@@ -667,5 +669,61 @@ DailyPlanRoute.objects.filter(lead_installer__ema)
         let cursor = source.find("__ema)").unwrap() + 5;
         let items = complete(&index, &dir.path().join("core/views.py"), &source, cursor);
         assert!(labels(items).contains(&"lead_installer__email".to_string()));
+    }
+
+    #[test]
+    fn completes_function_local_from_imports() {
+        let (dir, index) = fixture_index(&[
+            (
+                "blog/models.py",
+                r#"
+from django.db import models
+
+class Blog(models.Model):
+    title = models.CharField(max_length=255)
+"#,
+            ),
+            (
+                "blog/views.py",
+                r#"
+def run():
+    from .models import Blog
+    Blog.objects.filter(ti)
+"#,
+            ),
+        ]);
+
+        let source = fs::read_to_string(dir.path().join("blog/views.py")).unwrap();
+        let cursor = source.find("ti)").unwrap() + 2;
+        let items = complete(&index, &dir.path().join("blog/views.py"), &source, cursor);
+        assert!(labels(items).contains(&"title".to_string()));
+    }
+
+    #[test]
+    fn completes_function_local_module_alias_imports() {
+        let (dir, index) = fixture_index(&[
+            (
+                "blog/models.py",
+                r#"
+from django.db import models
+
+class Blog(models.Model):
+    title = models.CharField(max_length=255)
+"#,
+            ),
+            (
+                "blog/views.py",
+                r#"
+def run():
+    import blog.models as blog_models
+    blog_models.Blog.objects.filter(ti)
+"#,
+            ),
+        ]);
+
+        let source = fs::read_to_string(dir.path().join("blog/views.py")).unwrap();
+        let cursor = source.find("ti)").unwrap() + 2;
+        let items = complete(&index, &dir.path().join("blog/views.py"), &source, cursor);
+        assert!(labels(items).contains(&"title".to_string()));
     }
 }
