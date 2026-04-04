@@ -44,6 +44,11 @@ const GENERIC_LOOKUPS: &[&str] = &[
 ];
 
 const RELATION_FIELD_NAMES: &[&str] = &["ForeignKey", "OneToOneField", "ManyToManyField"];
+const DJANGO_MODEL_BASES: &[&str] = &[
+    "django.db.models.Model",
+    "django.contrib.auth.models.AbstractUser",
+    "django.contrib.auth.base_user.AbstractBaseUser",
+];
 const QUERYSET_PRESERVING_METHODS: &[&str] = &[
     "all",
     "filter",
@@ -147,6 +152,7 @@ pub struct WorkspaceIndex {
     pub modules: HashMap<PathBuf, ModuleInfo>,
     pub models: HashMap<ModelId, ModelInfo>,
     models_by_class_name: HashMap<String, Vec<ModelId>>,
+    settings: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +176,7 @@ struct PendingField {
 enum PendingRelationTarget {
     Qualified(String),
     StringLiteral(String),
+    SettingsKey(String),
 }
 
 #[derive(Debug)]
@@ -242,6 +249,7 @@ impl WorkspaceIndex {
         let mut analyses = Vec::new();
         let mut modules = HashMap::new();
         let mut raw_classes = Vec::new();
+        let mut settings = HashMap::new();
 
         for entry in builder.build() {
             let Ok(entry) = entry else {
@@ -262,6 +270,7 @@ impl WorkspaceIndex {
             };
 
             let analysis = analyze_source(&root, path, &source);
+            settings.extend(extract_settings_assignments(&analysis.body));
             raw_classes.extend(extract_raw_classes(&analysis));
             analyses.push(analysis);
         }
@@ -274,7 +283,10 @@ impl WorkspaceIndex {
                     continue;
                 }
 
-                let is_model = class.bases.iter().any(|base| base == "django.db.models.Model" || model_ids.contains(&ModelId::new(base.clone())));
+                let is_model = class
+                    .bases
+                    .iter()
+                    .any(|base| DJANGO_MODEL_BASES.contains(&base.as_str()) || model_ids.contains(&ModelId::new(base.clone())));
                 if is_model {
                     changed = true;
                     model_ids.insert(class.id.clone());
@@ -317,6 +329,7 @@ impl WorkspaceIndex {
                                 &class_module,
                                 &model_ids,
                                 &models_by_class_name,
+                                &settings,
                             )
                         }),
                     supported_lookups: GENERIC_LOOKUPS,
@@ -347,6 +360,7 @@ impl WorkspaceIndex {
                         &class.module_name,
                         &model_ids,
                         &models_by_class_name,
+                        &settings,
                     )
                 }) else {
                     continue;
@@ -400,6 +414,7 @@ impl WorkspaceIndex {
             modules,
             models,
             models_by_class_name,
+            settings,
         })
     }
 
@@ -410,6 +425,7 @@ impl WorkspaceIndex {
             modules: HashMap::new(),
             models: HashMap::new(),
             models_by_class_name: HashMap::new(),
+            settings: HashMap::new(),
         }
     }
 
@@ -419,6 +435,10 @@ impl WorkspaceIndex {
 
     pub fn config(&self) -> &DjangoLspConfig {
         &self.config
+    }
+
+    pub fn setting(&self, name: &str) -> Option<&str> {
+        self.settings.get(name).map(String::as_str)
     }
 
     pub fn module_for_path(&self, path: &Path) -> Option<&ModuleInfo> {
@@ -631,6 +651,46 @@ fn extract_raw_classes(analysis: &ModuleAnalysis) -> Vec<RawClassInfo> {
         .collect()
 }
 
+fn extract_settings_assignments(body: &[Stmt]) -> HashMap<String, String> {
+    let mut settings = HashMap::new();
+    for statement in body {
+        match statement {
+            Stmt::Assign(assign) => {
+                if assign.targets.len() != 1 {
+                    continue;
+                }
+
+                let Expr::Name(name) = &assign.targets[0] else {
+                    continue;
+                };
+
+                if !name.id.chars().all(|character| character.is_ascii_uppercase() || character == '_') {
+                    continue;
+                }
+
+                if let Some(value) = expr_string_value(&assign.value) {
+                    settings.insert(name.id.clone(), value);
+                }
+            }
+            Stmt::AnnAssign(assign) => {
+                let Expr::Name(name) = assign.target.as_ref() else {
+                    continue;
+                };
+
+                if !name.id.chars().all(|character| character.is_ascii_uppercase() || character == '_') {
+                    continue;
+                }
+
+                if let Some(value) = assign.value.as_ref().and_then(|value| expr_string_value(value)) {
+                    settings.insert(name.id.clone(), value);
+                }
+            }
+            _ => {}
+        }
+    }
+    settings
+}
+
 fn extract_raw_class(
     module_name: &str,
     local_class_names: &HashSet<String>,
@@ -735,6 +795,11 @@ fn extract_relation_target(
 ) -> Option<PendingRelationTarget> {
     match expr {
         Expr::StringLiteral(string_literal) => Some(PendingRelationTarget::StringLiteral(string_literal.value.to_str().to_string())),
+        Expr::Attribute(attribute)
+            if matches!(attribute.value.as_ref(), Expr::Name(name) if name.id.as_str() == "settings") =>
+        {
+            Some(PendingRelationTarget::SettingsKey(attribute.attr.id.clone()))
+        }
         Expr::Name(_) | Expr::Attribute(_) => qualify_expr(expr, module_name, local_class_names, imports)
             .map(PendingRelationTarget::Qualified),
         _ => {
@@ -777,6 +842,13 @@ fn keyword_string_value(keywords: &[ast::Keyword], expected_name: &str) -> Optio
     })
 }
 
+fn expr_string_value(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::StringLiteral(string_literal) => Some(string_literal.value.to_str().to_string()),
+        _ => None,
+    }
+}
+
 pub fn qualify_expr(
     expr: &Expr,
     module_name: &str,
@@ -807,6 +879,7 @@ fn resolve_relation_target(
     class_module: &str,
     model_ids: &HashSet<ModelId>,
     models_by_class_name: &HashMap<String, Vec<ModelId>>,
+    settings: &HashMap<String, String>,
 ) -> Option<ModelId> {
     match target {
         PendingRelationTarget::Qualified(qualified) => {
@@ -842,6 +915,15 @@ fn resolve_relation_target(
             } else {
                 None
             }
+        }
+        PendingRelationTarget::SettingsKey(setting_name) => {
+            let value = settings.get(setting_name)?;
+            let direct = ModelId::new(value.clone());
+            if model_ids.contains(&direct) {
+                return Some(direct);
+            }
+
+            resolve_app_label_model(value, models_by_class_name)
         }
     }
 }
@@ -1055,6 +1137,46 @@ from .models import Blog as Post
         assert_eq!(
             index.resolve_model_symbol_in_module(module, "Post").unwrap().as_str(),
             "blog.models.Blog"
+        );
+    }
+
+    #[test]
+    fn extracts_auth_user_model_setting_and_user_model() {
+        let dir = tempdir().unwrap();
+        let app_dir = dir.path().join("core");
+        let config_dir = dir.path().join("config");
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(app_dir.join("__init__.py"), "").unwrap();
+        fs::write(config_dir.join("__init__.py"), "").unwrap();
+        fs::write(
+            config_dir.join("settings.py"),
+            "AUTH_USER_MODEL = 'core.User'\n",
+        )
+        .unwrap();
+        fs::write(
+            app_dir.join("models.py"),
+            r#"
+from django.contrib.auth.models import AbstractUser
+from django.db import models
+from django.conf import settings
+
+class User(AbstractUser):
+    email = models.EmailField(unique=True)
+
+class Route(models.Model):
+    installer = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+"#,
+        )
+        .unwrap();
+
+        let index = build_index(dir.path());
+        assert_eq!(index.setting("AUTH_USER_MODEL"), Some("core.User"));
+        assert!(index.model(&ModelId::new("core.models.User")).is_some());
+        let route = index.model(&ModelId::new("core.models.Route")).unwrap();
+        assert_eq!(
+            route.field("installer").unwrap().related_model.as_ref().unwrap().as_str(),
+            "core.models.User"
         );
     }
 }

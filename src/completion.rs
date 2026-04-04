@@ -627,4 +627,45 @@ Team.objects.filter(auth)
         let items = complete(&index, &dir.path().join("blog/views.py"), &source, cursor);
         assert!(labels(items).contains(&"new_field".to_string()));
     }
+
+    #[test]
+    fn completes_auth_user_model_relations() {
+        let (dir, index) = fixture_index(&[
+            (
+                "config/settings.py",
+                "AUTH_USER_MODEL = 'core.User'\n",
+            ),
+            (
+                "core/models.py",
+                r#"
+from django.conf import settings
+from django.contrib.auth.models import AbstractUser
+from django.db import models
+
+class User(AbstractUser):
+    email = models.EmailField(unique=True)
+
+class DailyPlanRoute(models.Model):
+    lead_installer = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="led_routes",
+    )
+"#,
+            ),
+            (
+                "core/views.py",
+                r#"
+from .models import DailyPlanRoute
+
+DailyPlanRoute.objects.filter(lead_installer__ema)
+"#,
+            ),
+        ]);
+
+        let source = fs::read_to_string(dir.path().join("core/views.py")).unwrap();
+        let cursor = source.find("__ema)").unwrap() + 5;
+        let items = complete(&index, &dir.path().join("core/views.py"), &source, cursor);
+        assert!(labels(items).contains(&"lead_installer__email".to_string()));
+    }
 }
