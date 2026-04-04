@@ -10,6 +10,7 @@ use crate::index::{
 
 const QUERY_METHODS: &[&str] = &["filter", "exclude", "get"];
 const RELATION_LOOKUPS: &[&str] = &["exact", "in", "isnull"];
+const MAX_COMPLETION_RELATION_DEPTH: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletionRequest {
@@ -24,9 +25,11 @@ pub struct CompletionRequest {
 pub struct CompletionCandidate {
     pub label: String,
     pub insert_text: String,
+    pub filter_text: String,
     pub detail: String,
     pub kind: CompletionItemKind,
     sort_group: u8,
+    sort_rank: usize,
 }
 
 pub fn complete(
@@ -88,9 +91,10 @@ pub fn complete_lsp_items(
         .into_iter()
         .enumerate()
         .map(|(order, candidate)| CompletionItem {
-            label: candidate.label,
+            label: candidate.filter_text.clone(),
             kind: Some(candidate.kind),
             detail: Some(candidate.detail),
+            filter_text: Some(candidate.filter_text),
             sort_text: Some(format!("{order:04}")),
             text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                 range,
@@ -111,7 +115,7 @@ fn build_candidates(index: &WorkspaceIndex, root_model_id: &ModelId, token: &str
         segments.push("");
     }
 
-    let prefix = segments.pop().unwrap_or_default();
+    let _prefix = segments.pop().unwrap_or_default();
     let path_segments = segments;
     let mut current_model = root_model;
     let mut chain_parts = Vec::new();
@@ -140,17 +144,56 @@ fn build_candidates(index: &WorkspaceIndex, root_model_id: &ModelId, token: &str
 
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
+    let context_chain = chain_parts.join("__");
 
     match last_field {
         Some(field) if field.related_model.is_none() => {
-            add_lookup_candidates(&mut candidates, &mut seen, &chain_parts.join("__"), field.supported_lookups, prefix, field.name.as_str(), false);
+            add_lookup_candidates(
+                &mut candidates,
+                &mut seen,
+                &context_chain,
+                field.supported_lookups,
+                token,
+                field.name.as_str(),
+                false,
+                &context_chain,
+            );
         }
         Some(field) if field.related_model.is_some() => {
-            add_relation_lookup_candidates(&mut candidates, &mut seen, &chain_parts.join("__"), prefix, field.name.as_str());
-            add_field_candidates(&mut candidates, &mut seen, current_model, &chain_parts.join("__"), prefix);
+            add_relation_lookup_candidates(
+                &mut candidates,
+                &mut seen,
+                &context_chain,
+                token,
+                field.name.as_str(),
+                &context_chain,
+            );
+            let mut visited = HashSet::from([current_model.id.clone()]);
+            add_descendant_candidates(
+                &mut candidates,
+                &mut seen,
+                index,
+                current_model,
+                token,
+                &context_chain,
+                &context_chain,
+                0,
+                &mut visited,
+            );
         }
         None => {
-            add_field_candidates(&mut candidates, &mut seen, current_model, "", prefix);
+            let mut visited = HashSet::from([current_model.id.clone()]);
+            add_descendant_candidates(
+                &mut candidates,
+                &mut seen,
+                index,
+                current_model,
+                token,
+                "",
+                "",
+                0,
+                &mut visited,
+            );
         }
         Some(_) => {}
     }
@@ -158,39 +201,101 @@ fn build_candidates(index: &WorkspaceIndex, root_model_id: &ModelId, token: &str
     candidates.sort_by(|left, right| {
         left.sort_group
             .cmp(&right.sort_group)
-            .then_with(|| left.label.len().cmp(&right.label.len()))
-            .then_with(|| left.label.cmp(&right.label))
+            .then_with(|| left.sort_rank.cmp(&right.sort_rank))
+            .then_with(|| left.filter_text.len().cmp(&right.filter_text.len()))
+            .then_with(|| left.filter_text.cmp(&right.filter_text))
     });
     candidates
 }
 
-fn add_field_candidates(
+fn add_descendant_candidates(
+    candidates: &mut Vec<CompletionCandidate>,
+    seen: &mut HashSet<String>,
+    index: &WorkspaceIndex,
+    model: &crate::index::ModelInfo,
+    typed_token: &str,
+    context_chain: &str,
+    prefix_chain: &str,
+    relation_depth: usize,
+    visited: &mut HashSet<ModelId>,
+) {
+    for field in &model.fields {
+        let full_path = join_chain(prefix_chain, &field.name);
+        add_field_candidate(candidates, seen, model, &field.name, &full_path, typed_token, context_chain);
+
+        if field.related_model.is_some() {
+            add_relation_lookup_candidates(
+                candidates,
+                seen,
+                &full_path,
+                typed_token,
+                field.name.as_str(),
+                context_chain,
+            );
+
+            if relation_depth >= MAX_COMPLETION_RELATION_DEPTH {
+                continue;
+            }
+
+            let Some(related_model) = field.related_model.as_ref() else {
+                continue;
+            };
+            if !visited.insert(related_model.clone()) {
+                continue;
+            }
+
+            if let Some(next_model) = index.model(related_model) {
+                add_descendant_candidates(
+                    candidates,
+                    seen,
+                    index,
+                    next_model,
+                    typed_token,
+                    context_chain,
+                    &full_path,
+                    relation_depth + 1,
+                    visited,
+                );
+            }
+            visited.remove(related_model);
+        } else {
+            add_lookup_candidates(
+                candidates,
+                seen,
+                &full_path,
+                field.supported_lookups,
+                typed_token,
+                field.name.as_str(),
+                false,
+                context_chain,
+            );
+        }
+    }
+}
+
+fn add_field_candidate(
     candidates: &mut Vec<CompletionCandidate>,
     seen: &mut HashSet<String>,
     model: &crate::index::ModelInfo,
-    prefix_chain: &str,
-    typed_prefix: &str,
+    field_name: &str,
+    full_path: &str,
+    typed_token: &str,
+    context_chain: &str,
 ) {
-    for field in &model.fields {
-        if !field.name.starts_with(typed_prefix) {
-            continue;
-        }
+    if !full_path.starts_with(typed_token) {
+        return;
+    }
 
-        let insert_text = if prefix_chain.is_empty() {
-            field.name.clone()
-        } else {
-            format!("{prefix_chain}__{}", field.name)
-        };
-
-        if seen.insert(insert_text.clone()) {
-            candidates.push(CompletionCandidate {
-                label: insert_text.clone(),
-                insert_text,
-                detail: format!("field on {}", model.class_name),
-                kind: CompletionItemKind::FIELD,
-                sort_group: 0,
-            });
-        }
+    if seen.insert(full_path.to_string()) {
+        candidates.push(CompletionCandidate {
+            label: field_name.to_string(),
+            insert_text: completion_insert_text(full_path, context_chain),
+            filter_text: full_path.to_string(),
+            detail: format!("field on {}", model.class_name),
+            kind: CompletionItemKind::FIELD,
+            sort_group: 0,
+            sort_rank: path_depth(full_path) * 1000 + full_path.len(),
+        });
     }
 }
 
@@ -198,10 +303,20 @@ fn add_relation_lookup_candidates(
     candidates: &mut Vec<CompletionCandidate>,
     seen: &mut HashSet<String>,
     prefix_chain: &str,
-    typed_prefix: &str,
+    typed_token: &str,
     field_name: &str,
+    context_chain: &str,
 ) {
-    add_lookup_candidates(candidates, seen, prefix_chain, RELATION_LOOKUPS, typed_prefix, field_name, true);
+    add_lookup_candidates(
+        candidates,
+        seen,
+        prefix_chain,
+        RELATION_LOOKUPS,
+        typed_token,
+        field_name,
+        true,
+        context_chain,
+    );
 }
 
 fn add_lookup_candidates(
@@ -209,25 +324,24 @@ fn add_lookup_candidates(
     seen: &mut HashSet<String>,
     prefix_chain: &str,
     supported_lookups: &[&str],
-    typed_prefix: &str,
+    typed_token: &str,
     field_name: &str,
     relation_lookup: bool,
+    context_chain: &str,
 ) {
-    for lookup in supported_lookups {
-        if !lookup.starts_with(typed_prefix) {
+    for (rank, lookup) in supported_lookups.iter().enumerate() {
+        let filter_text = format!("{prefix_chain}__{lookup}");
+        if !filter_text.starts_with(typed_token) {
             continue;
         }
 
-        let insert_text = if prefix_chain.is_empty() {
-            format!("{field_name}__{lookup}")
-        } else {
-            format!("{prefix_chain}__{lookup}")
-        };
+        let label = (*lookup).to_string();
 
-        if seen.insert(insert_text.clone()) {
+        if seen.insert(filter_text.clone()) {
             candidates.push(CompletionCandidate {
-                label: insert_text.clone(),
-                insert_text,
+                label,
+                insert_text: completion_insert_text(&filter_text, context_chain),
+                filter_text,
                 detail: if relation_lookup {
                     format!("relation lookup on {field_name}")
                 } else {
@@ -235,9 +349,33 @@ fn add_lookup_candidates(
                 },
                 kind: CompletionItemKind::OPERATOR,
                 sort_group: 1,
+                sort_rank: path_depth(prefix_chain) * 1000 + rank,
             });
         }
     }
+}
+
+fn join_chain(prefix_chain: &str, segment: &str) -> String {
+    if prefix_chain.is_empty() {
+        segment.to_string()
+    } else {
+        format!("{prefix_chain}__{segment}")
+    }
+}
+
+fn completion_insert_text(full_path: &str, context_chain: &str) -> String {
+    if context_chain.is_empty() {
+        full_path.to_string()
+    } else {
+        full_path
+            .strip_prefix(&format!("{context_chain}__"))
+            .unwrap_or(full_path)
+            .to_string()
+    }
+}
+
+fn path_depth(path: &str) -> usize {
+    path.matches("__").count()
 }
 
 pub fn extract_completion_request(source: &str, cursor_offset: usize) -> Option<CompletionRequest> {
@@ -247,6 +385,10 @@ pub fn extract_completion_request(source: &str, cursor_offset: usize) -> Option<
 
     let replace_start = scan_identifier_start(source, cursor_offset);
     let token = source.get(replace_start..cursor_offset)?.to_string();
+    let segment_start = token
+        .rfind("__")
+        .map(|index| replace_start + index + 2)
+        .unwrap_or(replace_start);
     let significant_left = skip_whitespace_left(source, replace_start);
     let previous_char = significant_left.and_then(|index| source[..index].chars().next_back());
     if previous_char == Some('=') {
@@ -261,7 +403,7 @@ pub fn extract_completion_request(source: &str, cursor_offset: usize) -> Option<
     }
 
     Some(CompletionRequest {
-        replace_start,
+        replace_start: segment_start,
         replace_end: cursor_offset,
         token,
         base_expression,
@@ -464,7 +606,9 @@ Blog.objects.filter(ti)
         let source = fs::read_to_string(dir.path().join("blog/views.py")).unwrap();
         let cursor = source.find("ti)").unwrap() + 2;
         let items = complete(&index, &dir.path().join("blog/views.py"), &source, cursor);
-        assert_eq!(labels(items), vec!["title"]);
+        let labels = labels(items);
+        assert!(labels.contains(&"title".to_string()));
+        assert!(labels.contains(&"icontains".to_string()));
     }
 
     #[test]
@@ -500,9 +644,9 @@ Blog.objects.filter(author__)
         let cursor = source.find("author__)").unwrap() + "author__".len();
         let items = complete(&index, &dir.path().join("blog/views.py"), &source, cursor);
         let labels = labels(items);
-        assert!(labels.contains(&"author__email".to_string()));
-        assert!(labels.contains(&"author__team".to_string()));
-        assert!(labels.contains(&"author__isnull".to_string()));
+        assert!(labels.contains(&"email".to_string()));
+        assert!(labels.contains(&"team".to_string()));
+        assert!(labels.contains(&"isnull".to_string()));
     }
 
     #[test]
@@ -537,8 +681,92 @@ Blog.objects.filter(author__team__name__i)
         let cursor = source.find("__i)").unwrap() + 3;
         let items = complete(&index, &dir.path().join("blog/views.py"), &source, cursor);
         let labels = labels(items);
-        assert!(labels.contains(&"author__team__name__icontains".to_string()));
-        assert!(labels.contains(&"author__team__name__iexact".to_string()));
+        assert!(labels.contains(&"icontains".to_string()));
+        assert!(labels.contains(&"iexact".to_string()));
+    }
+
+    #[test]
+    fn completes_root_prefix_with_descendant_paths() {
+        let (dir, index) = fixture_index(&[
+            (
+                "blog/models.py",
+                r#"
+from django.db import models
+
+class Team(models.Model):
+    name = models.CharField(max_length=64)
+
+class Author(models.Model):
+    email = models.EmailField()
+    team = models.ForeignKey(Team, on_delete=models.CASCADE)
+
+class Blog(models.Model):
+    author = models.ForeignKey(Author, on_delete=models.CASCADE)
+"#,
+            ),
+            (
+                "blog/views.py",
+                r#"
+from .models import Blog
+
+Blog.objects.filter(au)
+"#,
+            ),
+        ]);
+
+        let source = fs::read_to_string(dir.path().join("blog/views.py")).unwrap();
+        let cursor = source.find("au)").unwrap() + 2;
+        let items = complete_lsp_items(&index, &dir.path().join("blog/views.py"), &source, cursor);
+        let labels = items.into_iter().map(|item| item.label).collect::<Vec<_>>();
+
+        assert!(labels.contains(&"author".to_string()));
+        assert!(labels.contains(&"author__email".to_string()));
+        assert!(labels.contains(&"author__team".to_string()));
+        assert!(labels.contains(&"author__team__name".to_string()));
+        assert!(labels.contains(&"author__email__icontains".to_string()));
+    }
+
+    #[test]
+    fn descendant_paths_insert_only_missing_suffix() {
+        let (dir, index) = fixture_index(&[
+            (
+                "blog/models.py",
+                r#"
+from django.db import models
+
+class Team(models.Model):
+    name = models.CharField(max_length=64)
+
+class Author(models.Model):
+    team = models.ForeignKey(Team, on_delete=models.CASCADE)
+
+class Blog(models.Model):
+    author = models.ForeignKey(Author, on_delete=models.CASCADE)
+"#,
+            ),
+            (
+                "blog/views.py",
+                r#"
+from .models import Blog
+
+Blog.objects.filter(author__te)
+"#,
+            ),
+        ]);
+
+        let source = fs::read_to_string(dir.path().join("blog/views.py")).unwrap();
+        let cursor = source.find("__te)").unwrap() + 4;
+        let items = complete_lsp_items(&index, &dir.path().join("blog/views.py"), &source, cursor);
+        let team_name = items
+            .into_iter()
+            .find(|item| item.label == "author__team__name")
+            .unwrap();
+
+        let edit = match team_name.text_edit.unwrap() {
+            CompletionTextEdit::Edit(edit) => edit,
+            CompletionTextEdit::InsertAndReplace(_) => panic!("unexpected insert-and-replace edit"),
+        };
+        assert_eq!(edit.new_text, "team__name");
     }
 
     #[test]
@@ -668,7 +896,7 @@ DailyPlanRoute.objects.filter(lead_installer__ema)
         let source = fs::read_to_string(dir.path().join("core/views.py")).unwrap();
         let cursor = source.find("__ema)").unwrap() + 5;
         let items = complete(&index, &dir.path().join("core/views.py"), &source, cursor);
-        assert!(labels(items).contains(&"lead_installer__email".to_string()));
+        assert!(labels(items).contains(&"email".to_string()));
     }
 
     #[test]
@@ -725,5 +953,40 @@ def run():
         let cursor = source.find("ti)").unwrap() + 2;
         let items = complete(&index, &dir.path().join("blog/views.py"), &source, cursor);
         assert!(labels(items).contains(&"title".to_string()));
+    }
+
+    #[test]
+    fn lsp_items_keep_full_filter_text_for_lookup_suffixes() {
+        let (dir, index) = fixture_index(&[
+            (
+                "blog/models.py",
+                r#"
+from django.db import models
+
+class Blog(models.Model):
+    notes = models.TextField()
+"#,
+            ),
+            (
+                "blog/views.py",
+                r#"
+from .models import Blog
+
+Blog.objects.filter(notes__)
+"#,
+            ),
+        ]);
+
+        let source = fs::read_to_string(dir.path().join("blog/views.py")).unwrap();
+        let cursor = source.find("notes__)").unwrap() + "notes__".len();
+        let items = complete_lsp_items(&index, &dir.path().join("blog/views.py"), &source, cursor);
+        let exact = items.into_iter().find(|item| item.label == "notes__exact").unwrap();
+
+        assert_eq!(exact.filter_text.as_deref(), Some("notes__exact"));
+        let edit = match exact.text_edit.unwrap() {
+            CompletionTextEdit::Edit(edit) => edit,
+            CompletionTextEdit::InsertAndReplace(_) => panic!("unexpected insert-and-replace edit"),
+        };
+        assert_eq!(edit.new_text, "exact");
     }
 }

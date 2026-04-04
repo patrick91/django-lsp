@@ -29,18 +29,18 @@ const DEFAULT_EXCLUDES: &[&str] = &[
 const GENERIC_LOOKUPS: &[&str] = &[
     "exact",
     "iexact",
-    "contains",
     "icontains",
-    "in",
-    "gt",
-    "gte",
-    "lt",
-    "lte",
-    "isnull",
+    "contains",
     "startswith",
     "istartswith",
     "endswith",
     "iendswith",
+    "in",
+    "isnull",
+    "gt",
+    "gte",
+    "lt",
+    "lte",
 ];
 
 const RELATION_FIELD_NAMES: &[&str] = &["ForeignKey", "OneToOneField", "ManyToManyField"];
