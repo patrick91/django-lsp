@@ -1,0 +1,22 @@
+[package]
+name = "django-lsp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+globset = "0.4.18"
+ignore = "0.4.25"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+tokio = { version = "1.48.0", features = ["io-std", "macros", "rt-multi-thread", "sync"] }
+toml = "1.1.2"
+tower-lsp = "0.20.0"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+
+ruff_python_ast = { git = "https://github.com/astral-sh/ruff.git", tag = "v0.4.10" }
+ruff_python_parser = { git = "https://github.com/astral-sh/ruff.git", tag = "v0.4.10" }
+ruff_text_size = { git = "https://github.com/astral-sh/ruff.git", tag = "v0.4.10" }
+
+[dev-dependencies]
+tempfile = "3.23.0"
