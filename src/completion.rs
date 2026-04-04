@@ -540,6 +540,70 @@ Blog.objects.filter(author__team__name__i)
     }
 
     #[test]
+    fn completes_explicit_reverse_relations() {
+        let (dir, index) = fixture_index(&[
+            (
+                "blog/models.py",
+                r#"
+from django.db import models
+
+class Blog(models.Model):
+    title = models.CharField(max_length=255)
+
+class Entry(models.Model):
+    blog = models.ForeignKey(Blog, on_delete=models.CASCADE, related_name="entries")
+    headline = models.CharField(max_length=255)
+"#,
+            ),
+            (
+                "blog/views.py",
+                r#"
+from .models import Blog
+
+Blog.objects.filter(ent)
+"#,
+            ),
+        ]);
+
+        let source = fs::read_to_string(dir.path().join("blog/views.py")).unwrap();
+        let cursor = source.find("ent)").unwrap() + 3;
+        let items = complete(&index, &dir.path().join("blog/views.py"), &source, cursor);
+        assert!(labels(items).contains(&"entries".to_string()));
+    }
+
+    #[test]
+    fn completes_default_reverse_relation_queries() {
+        let (dir, index) = fixture_index(&[
+            (
+                "blog/models.py",
+                r#"
+from django.db import models
+
+class Team(models.Model):
+    name = models.CharField(max_length=64)
+
+class Author(models.Model):
+    team = models.ForeignKey(Team, on_delete=models.CASCADE)
+    email = models.EmailField()
+"#,
+            ),
+            (
+                "blog/views.py",
+                r#"
+from .models import Team
+
+Team.objects.filter(auth)
+"#,
+            ),
+        ]);
+
+        let source = fs::read_to_string(dir.path().join("blog/views.py")).unwrap();
+        let cursor = source.find("auth)").unwrap() + 4;
+        let items = complete(&index, &dir.path().join("blog/views.py"), &source, cursor);
+        assert!(labels(items).contains(&"author".to_string()));
+    }
+
+    #[test]
     fn uses_unsaved_buffers_for_model_fields() {
         let dir = tempdir().unwrap();
         fs::create_dir_all(dir.path().join("blog")).unwrap();

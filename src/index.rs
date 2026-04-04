@@ -163,6 +163,7 @@ struct PendingField {
     name: String,
     kind: FieldKind,
     relation_target: Option<PendingRelationTarget>,
+    reverse_query_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -296,15 +297,15 @@ impl WorkspaceIndex {
         }
 
         let mut models = HashMap::new();
-        for class in raw_classes.into_iter().filter(|class| model_ids.contains(&class.id)) {
+        for class in raw_classes.iter().filter(|class| model_ids.contains(&class.id)) {
             let class_id = class.id.clone();
             let class_module = class.module_name.clone();
             let class_name = class.class_name.clone();
             let fields = class
                 .fields
-                .into_iter()
+                .iter()
                 .map(|field| FieldInfo {
-                    name: field.name,
+                    name: field.name.clone(),
                     kind: field.kind,
                     related_model: field
                         .relation_target
@@ -331,6 +332,45 @@ impl WorkspaceIndex {
                     fields,
                 },
             );
+        }
+
+        for class in raw_classes.iter().filter(|class| model_ids.contains(&class.id)) {
+            for field in &class.fields {
+                let Some(reverse_query_name) = field.reverse_query_name.as_ref() else {
+                    continue;
+                };
+
+                let Some(target) = field.relation_target.as_ref().and_then(|target| {
+                    resolve_relation_target(
+                        target,
+                        &class.id,
+                        &class.module_name,
+                        &model_ids,
+                        &models_by_class_name,
+                    )
+                }) else {
+                    continue;
+                };
+
+                let Some(target_model) = models.get_mut(&target) else {
+                    continue;
+                };
+
+                if target_model
+                    .fields
+                    .iter()
+                    .any(|existing| existing.name == *reverse_query_name)
+                {
+                    continue;
+                }
+
+                target_model.fields.push(FieldInfo {
+                    name: reverse_query_name.clone(),
+                    kind: field.kind,
+                    related_model: Some(class.id.clone()),
+                    supported_lookups: GENERIC_LOOKUPS,
+                });
+            }
         }
 
         for analysis in analyses {
@@ -682,6 +722,7 @@ fn extract_field_from_value(
         name: target_name.to_string(),
         kind,
         relation_target,
+        reverse_query_name: relation_query_name(kind, class_name, &call.arguments.keywords),
     })
 }
 
@@ -701,6 +742,39 @@ fn extract_relation_target(
             None
         }
     }
+}
+
+fn relation_query_name(
+    kind: FieldKind,
+    class_name: &str,
+    keywords: &[ast::Keyword],
+) -> Option<String> {
+    if !kind.is_relation() {
+        return None;
+    }
+
+    let related_name = keyword_string_value(keywords, "related_name");
+    if related_name.as_deref().is_some_and(|name| name.contains('+')) {
+        return None;
+    }
+
+    keyword_string_value(keywords, "related_query_name")
+        .or(related_name)
+        .or_else(|| Some(class_name.to_lowercase()))
+}
+
+fn keyword_string_value(keywords: &[ast::Keyword], expected_name: &str) -> Option<String> {
+    keywords.iter().find_map(|keyword| {
+        let arg = keyword.arg.as_ref()?;
+        if arg.as_str() != expected_name {
+            return None;
+        }
+
+        match &keyword.value {
+            Expr::StringLiteral(string_literal) => Some(string_literal.value.to_str().to_string()),
+            _ => None,
+        }
+    })
 }
 
 pub fn qualify_expr(
