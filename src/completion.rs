@@ -32,6 +32,9 @@ pub struct CompletionCandidate {
     sort_rank: usize,
 }
 
+// Completions are intentionally query-expression oriented rather than kwarg-name-only.
+// For example, `Blog.objects.filter(ti)` should suggest `title` and `title__icontains`,
+// not just completions after an explicit `=` keyword argument boundary.
 pub fn complete(
     index: &WorkspaceIndex,
     path: &Path,
@@ -577,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn completes_direct_fields() {
+    fn completes_query_expression_prefixes() {
         let (dir, index) = fixture_index(&[
             (
                 "blog/models.py",
