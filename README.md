@@ -10,20 +10,27 @@ from .models import Blog
 Blog.objects.filter(author__team__name__icontains="Django")
 ```
 
-## Quick start
+## Installation
 
-`django-lsp` requires Rust 1.95 or newer.
+Install the language server from PyPI with `uv`:
 
 ```console
-cargo build --release
+uv tool install django-lsp
 ```
 
-Point an editor's LSP client at `target/release/django-lsp`, with no arguments. The server uses
-standard input and output for LSP communication.
+`pipx install django-lsp` and `python -m pip install django-lsp` are also supported. Confirm the
+installed executable is available with:
+
+```console
+django-lsp --version
+```
+
+Point an editor's LSP client at the `django-lsp` command, with no arguments. The server uses standard
+input and output for LSP communication.
 
 ## Documentation
 
-- [Getting started](docs/getting-started.md) covers building and connecting an editor.
+- [Getting started](docs/getting-started.md) covers installing, building, and connecting an editor.
 - [Completion examples](docs/completions.md) shows executable examples generated from the real LSP.
 - [Configuration](docs/configuration.md) documents `pyproject.toml` options.
 - [Testing](docs/testing.md) explains the Rust, protocol, documentation, and Django compatibility
@@ -40,6 +47,8 @@ standard input and output for LSP communication.
 - unsaved editor buffer updates
 
 ## Development
+
+Building from source requires Rust 1.95 or newer.
 
 ```console
 cargo fmt --all -- --check

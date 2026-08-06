@@ -5,7 +5,7 @@ testing its completion behavior.
 
 ## Guides
 
-1. [Getting started](getting-started.md) — build the binary and connect an LSP client.
+1. [Getting started](getting-started.md) — install or build the binary and connect an LSP client.
 2. [Completion examples](completions.md) — see query completions produced by the real server.
 3. [Configuration](configuration.md) — control indexing for a Django workspace.
 4. [Testing](testing.md) — run unit, protocol, executable documentation, and compatibility tests.
