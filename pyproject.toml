@@ -16,7 +16,6 @@ classifiers = [
     "Framework :: Django",
     "Intended Audience :: Developers",
     "Programming Language :: Rust",
-    "Topic :: Software Development :: Integrated Development Environments (IDE)",
 ]
 
 [project.urls]
