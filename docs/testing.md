@@ -31,21 +31,27 @@ cargo test --test lsp_protocol
 
 ## Executable completion examples
 
-The human-facing [completion examples](completions.md) are generated from Markdown in
-`docs/src/completions.md`. A `django-lsp` fence contains normal Python plus one `<cursor>` marker:
+The human-facing [completion examples](completions.md) contain hidden scenario directives next to
+their visible generated output. Each directive contains normal Python plus one `<cursor>` marker:
 
 ````markdown
-```django-lsp file=blog/views.py limit=8
+<!-- django-lsp-example file=blog/views.py limit=8
 from .models import Blog
 
 Blog.objects.filter(
     author__te<cursor>
 )
+-->
+<!-- django-lsp-output:start -->
+```text
+The renderer writes the completion menu here.
 ```
+<!-- django-lsp-output:end -->
 ````
 
 The renderer opens that source through the real language server, requests completion at the marker,
-and writes a text representation of the returned menu.
+and rewrites only the adjacent output block. The scenario and its result therefore remain together
+in the existing documentation page.
 
 Regenerate the checked-in page after an intentional completion change:
 

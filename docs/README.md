@@ -24,7 +24,7 @@ The current non-goals are:
 
 ## Executable documentation
 
-[Completion examples](completions.md) is generated from Markdown scenarios in `docs/src`. Each
-scenario is sent through the same JSON-RPC language server used by editors, so the visible completion
-menus are checked rather than copied by hand. See [Testing](testing.md#executable-completion-examples)
-for the authoring and update workflow.
+[Completion examples](completions.md) keeps each authored scenario and rendered result together in
+one Markdown file. The hidden scenario source is sent through the same JSON-RPC language server used
+by editors, so the visible completion menus are checked rather than copied by hand. See
+[Testing](testing.md#executable-completion-examples) for the authoring and update workflow.
