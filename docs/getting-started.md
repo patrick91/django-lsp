@@ -2,16 +2,32 @@
 
 ## Requirements
 
-- Rust 1.95 or newer
 - an editor or plugin that can launch a language server over standard input and output
 - a Django workspace containing statically declared models
 
 Django itself is not required to run the language server. The server reads Python source without
 importing the project.
 
-## Build the server
+## Install the server
 
-From the repository root:
+The recommended installation uses `uv` to keep the executable isolated from project dependencies:
+
+```console
+uv tool install django-lsp
+```
+
+You can also use `pipx install django-lsp` or `python -m pip install django-lsp`. Verify the command
+is on your path before configuring an editor:
+
+```console
+django-lsp --version
+```
+
+Upgrade an existing `uv` installation with `uv tool upgrade django-lsp`.
+
+## Build from source
+
+Building from source requires Rust 1.95 or newer. From the repository root:
 
 ```console
 cargo build --release
@@ -26,7 +42,7 @@ For a faster development build, use `cargo build` and point the client at
 
 Configure a Python language-server entry with:
 
-- command: the absolute path to the `django-lsp` executable
+- command: `django-lsp`, or the absolute path to the executable if it is not on the editor's path
 - arguments: none
 - transport: standard input and output
 - workspace root: the Django project root

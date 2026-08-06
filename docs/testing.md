@@ -79,3 +79,15 @@ uv run --no-project --python 3.12 --with 'Django~=6.1.0' python manage.py test
 
 The fixture's own Django tests verify that its model and relation metadata remains valid. The Rust
 protocol tests then verify that those same patterns produce the expected editor completions.
+
+## Distribution wheels
+
+The release workflow builds the same platform wheels used for tagged releases on every pull request:
+
+- Linux x86-64 and ARM64
+- macOS Intel and Apple Silicon
+- Windows x86-64
+
+Each job installs its wheel with `uv tool install` on a native runner and executes
+`django-lsp --version`. Tagged `v*` builds publish those already-tested artifacts to GitHub Releases
+and PyPI; pull requests never receive publishing permissions.

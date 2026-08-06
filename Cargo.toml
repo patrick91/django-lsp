@@ -3,6 +3,13 @@ name = "django-lsp"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
+description = "A language server for Django ORM query completions"
+readme = "README.md"
+repository = "https://github.com/patrick91/django-lsp"
+homepage = "https://github.com/patrick91/django-lsp"
+keywords = ["django", "lsp", "language-server", "autocomplete"]
+categories = ["development-tools"]
+publish = false
 
 [dependencies]
 globset = "0.4.20"

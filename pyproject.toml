@@ -1,0 +1,29 @@
+[build-system]
+requires = ["maturin>=1.11,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "django-lsp"
+dynamic = ["version"]
+description = "A language server for Django ORM query completions"
+readme = "README.md"
+requires-python = ">=3.9"
+keywords = ["django", "lsp", "language-server", "autocomplete"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Framework :: Django",
+    "Intended Audience :: Developers",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Integrated Development Environments (IDE)",
+]
+
+[project.urls]
+Documentation = "https://github.com/patrick91/django-lsp/tree/main/docs"
+Issues = "https://github.com/patrick91/django-lsp/issues"
+Repository = "https://github.com/patrick91/django-lsp"
+
+[tool.maturin]
+bindings = "bin"
+strip = true
+targets = [{ name = "django-lsp", kind = "bin" }]
