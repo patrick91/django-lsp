@@ -17,11 +17,13 @@ pub struct DocumentStore {
 
 impl DocumentStore {
     pub fn open(&mut self, path: PathBuf, version: i32, text: String) {
-        self.documents.insert(path, DocumentSnapshot { text, version });
+        self.documents
+            .insert(path, DocumentSnapshot { text, version });
     }
 
     pub fn update(&mut self, path: PathBuf, version: i32, text: String) {
-        self.documents.insert(path, DocumentSnapshot { text, version });
+        self.documents
+            .insert(path, DocumentSnapshot { text, version });
     }
 
     pub fn close(&mut self, path: &Path) {
@@ -37,6 +39,7 @@ impl DocumentStore {
             return Ok(snapshot.text.clone());
         }
 
-        fs::read_to_string(path).map_err(|source| DjangoLspError::io(path.display().to_string(), source))
+        fs::read_to_string(path)
+            .map_err(|source| DjangoLspError::io(path.display().to_string(), source))
     }
 }

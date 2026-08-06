@@ -1,46 +1,52 @@
 # django-lsp
 
-`django-lsp` is a Rust language server focused on Django ORM query completions.
+`django-lsp` is a Rust language server focused on Django ORM query completions. It uses Ruff's
+Python parser to build a static workspace index and follows Django model relations without importing
+or executing the project.
 
-It currently uses Ruff's Python parser for static analysis and is intentionally narrow in scope:
+```python
+from .models import Blog
+
+Blog.objects.filter(author__team__name__icontains="Django")
+```
+
+## Quick start
+
+`django-lsp` requires Rust 1.95 or newer.
+
+```console
+cargo build --release
+```
+
+Point an editor's LSP client at `target/release/django-lsp`, with no arguments. The server uses
+standard input and output for LSP communication.
+
+## Documentation
+
+- [Getting started](docs/getting-started.md) covers building and connecting an editor.
+- [Completion examples](docs/completions.md) shows executable examples generated from the real LSP.
+- [Configuration](docs/configuration.md) documents `pyproject.toml` options.
+- [Testing](docs/testing.md) explains the Rust, protocol, documentation, and Django compatibility
+  test layers.
+- [Documentation index](docs/README.md) provides the complete guide map.
+
+## Current scope
 
 - workspace model indexing
-- relation traversal
 - completion inside `filter(...)`, `exclude(...)`, and `get(...)`
+- forward, reverse, and recursive relation traversal
+- `AUTH_USER_MODEL` support
+- function-local and dotted import resolution
+- unsaved editor buffer updates
 
-## Completion Model
+## Development
 
-Completions are query-expression oriented, not kwarg-name-only.
-
-That means these are both intended:
-
-```python
-Blog.objects.filter(title__icontains="hello")
+```console
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo run --bin render-docs -- --check
+cargo test --all-targets
 ```
 
-```python
-Blog.objects.filter(ti)
-```
-
-At `ti`, the server may suggest:
-
-- `title`
-- `title__exact`
-- `title__icontains`
-
-This is deliberate. The goal is to help build Django query expressions anywhere inside the query call, not only after a keyword boundary.
-
-## Current Scope
-
-- Django model detection from static analysis
-- forward and reverse relation completions
-- `AUTH_USER_MODEL` support from settings-like assignments
-- function-local import resolution
-- recursive descendant-path suggestions up to a bounded depth
-
-## Non-Goals for Now
-
-- Django runtime introspection
-- full type-aware lookup filtering
-- support for every dynamic import or model-loading pattern
-- general Python language features outside Django query completion
+The project intentionally does not provide Django runtime introspection, general Python language
+features, or exhaustive support for dynamic model-loading patterns.

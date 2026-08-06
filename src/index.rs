@@ -15,14 +15,14 @@ use crate::document_store::DocumentStore;
 use crate::error::{DjangoLspError, Result};
 
 const DEFAULT_EXCLUDES: &[&str] = &[
-    ".git/**",
-    "node_modules/**",
-    "dist/**",
-    "build/**",
-    ".venv/**",
-    "venv/**",
-    "site-packages/**",
-    "__pycache__/**",
+    "**/.git/**",
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/.venv/**",
+    "**/venv/**",
+    "**/site-packages/**",
+    "**/__pycache__/**",
     "**/migrations/**",
 ];
 
@@ -194,7 +194,10 @@ impl PathMatcher {
             Some(build_globset(root, &config.include)?)
         };
 
-        let mut exclude_patterns = DEFAULT_EXCLUDES.iter().map(|pattern| pattern.to_string()).collect::<Vec<_>>();
+        let mut exclude_patterns = DEFAULT_EXCLUDES
+            .iter()
+            .map(|pattern| pattern.to_string())
+            .collect::<Vec<_>>();
         exclude_patterns.extend(config.exclude.iter().cloned());
         let exclude = build_globset(root, &exclude_patterns)?;
 
@@ -225,18 +228,29 @@ impl PathMatcher {
 fn build_globset(root: &Path, patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
-        builder.add(Glob::new(pattern).map_err(|source| DjangoLspError::glob(pattern.clone(), source))?);
+        builder.add(
+            Glob::new(pattern).map_err(|source| DjangoLspError::glob(pattern.clone(), source))?,
+        );
         if !pattern.starts_with("**/") && !pattern.starts_with('.') && !pattern.contains('/') {
             let scoped = format!("**/{pattern}");
-            builder.add(Glob::new(&scoped).map_err(|source| DjangoLspError::glob(scoped.clone(), source))?);
+            builder.add(
+                Glob::new(&scoped)
+                    .map_err(|source| DjangoLspError::glob(scoped.clone(), source))?,
+            );
         }
     }
     let _ = root;
-    builder.build().map_err(|source| DjangoLspError::glob("globset".to_string(), source))
+    builder
+        .build()
+        .map_err(|source| DjangoLspError::glob("globset".to_string(), source))
 }
 
 impl WorkspaceIndex {
-    pub fn build(workspace_root: &Path, config: DjangoLspConfig, documents: &DocumentStore) -> Result<Self> {
+    pub fn build(
+        workspace_root: &Path,
+        config: DjangoLspConfig,
+        documents: &DocumentStore,
+    ) -> Result<Self> {
         let root = config.effective_root(workspace_root);
         let matcher = PathMatcher::new(&root, &config)?;
         let mut builder = WalkBuilder::new(&root);
@@ -256,7 +270,11 @@ impl WorkspaceIndex {
                 continue;
             };
             let path = entry.path();
-            if !entry.file_type().is_some_and(|file_type| file_type.is_file()) || !matcher.matches(path) {
+            if !entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_file())
+                || !matcher.matches(path)
+            {
                 continue;
             }
 
@@ -270,7 +288,9 @@ impl WorkspaceIndex {
             };
 
             let analysis = analyze_source(&root, path, &source);
-            settings.extend(extract_settings_assignments(&analysis.body));
+            if is_settings_module(&analysis.module_name, config.settings_module.as_deref()) {
+                settings.extend(extract_settings_assignments(&analysis.body));
+            }
             raw_classes.extend(extract_raw_classes(&analysis));
             analyses.push(analysis);
         }
@@ -283,10 +303,10 @@ impl WorkspaceIndex {
                     continue;
                 }
 
-                let is_model = class
-                    .bases
-                    .iter()
-                    .any(|base| DJANGO_MODEL_BASES.contains(&base.as_str()) || model_ids.contains(&ModelId::new(base.clone())));
+                let is_model = class.bases.iter().any(|base| {
+                    DJANGO_MODEL_BASES.contains(&base.as_str())
+                        || model_ids.contains(&ModelId::new(base.clone()))
+                });
                 if is_model {
                     changed = true;
                     model_ids.insert(class.id.clone());
@@ -309,7 +329,10 @@ impl WorkspaceIndex {
         }
 
         let mut models = HashMap::new();
-        for class in raw_classes.iter().filter(|class| model_ids.contains(&class.id)) {
+        for class in raw_classes
+            .iter()
+            .filter(|class| model_ids.contains(&class.id))
+        {
             let class_id = class.id.clone();
             let class_module = class.module_name.clone();
             let class_name = class.class_name.clone();
@@ -319,19 +342,16 @@ impl WorkspaceIndex {
                 .map(|field| FieldInfo {
                     name: field.name.clone(),
                     kind: field.kind,
-                    related_model: field
-                        .relation_target
-                        .as_ref()
-                        .and_then(|target| {
-                            resolve_relation_target(
-                                target,
-                                &class_id,
-                                &class_module,
-                                &model_ids,
-                                &models_by_class_name,
-                                &settings,
-                            )
-                        }),
+                    related_model: field.relation_target.as_ref().and_then(|target| {
+                        resolve_relation_target(
+                            target,
+                            &class_id,
+                            &class_module,
+                            &model_ids,
+                            &models_by_class_name,
+                            &settings,
+                        )
+                    }),
                     supported_lookups: GENERIC_LOOKUPS,
                 })
                 .collect();
@@ -347,7 +367,10 @@ impl WorkspaceIndex {
             );
         }
 
-        for class in raw_classes.iter().filter(|class| model_ids.contains(&class.id)) {
+        for class in raw_classes
+            .iter()
+            .filter(|class| model_ids.contains(&class.id))
+        {
             for field in &class.fields {
                 let Some(reverse_query_name) = field.reverse_query_name.as_ref() else {
                     continue;
@@ -450,16 +473,24 @@ impl WorkspaceIndex {
     }
 
     pub fn resolve_model_symbol(&self, module_name: &str, local_name: &str) -> Option<ModelId> {
-        let module = self.modules.values().find(|module| module.module_name == module_name)?;
+        let module = self
+            .modules
+            .values()
+            .find(|module| module.module_name == module_name)?;
         self.resolve_model_symbol_in_module(module, local_name)
     }
 
-    pub fn resolve_model_symbol_in_module(&self, module: &ModuleInfo, local_name: &str) -> Option<ModelId> {
-        module
-            .model_names
-            .get(local_name)
-            .cloned()
-            .or_else(|| module.imports.get(local_name).and_then(|qualified| self.resolve_qualified_model(qualified)))
+    pub fn resolve_model_symbol_in_module(
+        &self,
+        module: &ModuleInfo,
+        local_name: &str,
+    ) -> Option<ModelId> {
+        module.model_names.get(local_name).cloned().or_else(|| {
+            module
+                .imports
+                .get(local_name)
+                .and_then(|qualified| self.resolve_qualified_model(qualified))
+        })
     }
 
     pub fn resolve_qualified_model(&self, qualified: &str) -> Option<ModelId> {
@@ -508,7 +539,7 @@ pub fn analyze_source(root: &Path, path: &Path, source: &str) -> ModuleAnalysis 
         .body
         .iter()
         .filter_map(|statement| match statement {
-            Stmt::ClassDef(class_def) => Some(class_def.name.id.clone()),
+            Stmt::ClassDef(class_def) => Some(class_def.name.id.to_string()),
             _ => None,
         })
         .collect();
@@ -519,7 +550,7 @@ pub fn analyze_source(root: &Path, path: &Path, source: &str) -> ModuleAnalysis 
         is_package,
         imports,
         local_class_names,
-        body: syntax.body,
+        body: syntax.body.to_vec(),
     }
 }
 
@@ -540,12 +571,15 @@ fn module_name_from_path(root: &Path, path: &Path) -> String {
         return "__root__".to_string();
     }
 
-    if components.last().is_some_and(|component| component == "__init__.py") {
+    if components
+        .last()
+        .is_some_and(|component| component == "__init__.py")
+    {
         components.pop();
-    } else if let Some(last) = components.last_mut() {
-        if let Some(stem) = Path::new(last).file_stem().and_then(|stem| stem.to_str()) {
-            *last = stem.to_string();
-        }
+    } else if let Some(last) = components.last_mut()
+        && let Some(stem) = Path::new(last).file_stem().and_then(|stem| stem.to_str())
+    {
+        *last = stem.to_string();
     }
 
     if components.is_empty() {
@@ -572,12 +606,17 @@ fn apply_import_statement(
     match statement {
         Stmt::Import(import_stmt) => {
             for alias in &import_stmt.names {
-                let local_name = alias
-                    .asname
-                    .as_ref()
-                    .map(|asname| asname.id.clone())
-                    .unwrap_or_else(|| alias.name.id.split('.').next().unwrap_or(alias.name.as_str()).to_string());
-                imports.insert(local_name, alias.name.id.clone());
+                if let Some(asname) = &alias.asname {
+                    imports.insert(asname.id.to_string(), alias.name.id.to_string());
+                } else {
+                    let local_name = alias
+                        .name
+                        .id
+                        .split('.')
+                        .next()
+                        .unwrap_or(alias.name.as_str());
+                    imports.insert(local_name.to_string(), local_name.to_string());
+                }
             }
         }
         Stmt::ImportFrom(import_from) => {
@@ -598,8 +637,8 @@ fn apply_import_statement(
                 let local_name = alias
                     .asname
                     .as_ref()
-                    .map(|asname| asname.id.clone())
-                    .unwrap_or_else(|| alias.name.id.clone());
+                    .map(|asname| asname.id.to_string())
+                    .unwrap_or_else(|| alias.name.id.to_string());
                 imports.insert(local_name, format!("{module}.{}", alias.name.id));
             }
         }
@@ -607,7 +646,19 @@ fn apply_import_statement(
     }
 }
 
-fn resolve_import_module(module_name: &str, is_package: bool, level: u32, imported_module: Option<&str>) -> Option<String> {
+fn is_settings_module(module_name: &str, configured_module: Option<&str>) -> bool {
+    configured_module.map_or_else(
+        || module_name.rsplit('.').next() == Some("settings"),
+        |configured| module_name == configured,
+    )
+}
+
+fn resolve_import_module(
+    module_name: &str,
+    is_package: bool,
+    level: u32,
+    imported_module: Option<&str>,
+) -> Option<String> {
     if level == 0 {
         return imported_module.map(ToOwned::to_owned);
     }
@@ -624,13 +675,14 @@ fn resolve_import_module(module_name: &str, is_package: bool, level: u32, import
     let mut parts = if package.is_empty() {
         Vec::new()
     } else {
-        package.split('.').map(ToOwned::to_owned).collect::<Vec<_>>()
+        package
+            .split('.')
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>()
     };
 
     for _ in 0..level.saturating_sub(1) {
-        if parts.pop().is_none() {
-            return None;
-        }
+        parts.pop()?;
     }
 
     if let Some(imported) = imported_module {
@@ -673,12 +725,16 @@ fn extract_settings_assignments(body: &[Stmt]) -> HashMap<String, String> {
                     continue;
                 };
 
-                if !name.id.chars().all(|character| character.is_ascii_uppercase() || character == '_') {
+                if !name
+                    .id
+                    .chars()
+                    .all(|character| character.is_ascii_uppercase() || character == '_')
+                {
                     continue;
                 }
 
                 if let Some(value) = expr_string_value(&assign.value) {
-                    settings.insert(name.id.clone(), value);
+                    settings.insert(name.id.to_string(), value);
                 }
             }
             Stmt::AnnAssign(assign) => {
@@ -686,12 +742,20 @@ fn extract_settings_assignments(body: &[Stmt]) -> HashMap<String, String> {
                     continue;
                 };
 
-                if !name.id.chars().all(|character| character.is_ascii_uppercase() || character == '_') {
+                if !name
+                    .id
+                    .chars()
+                    .all(|character| character.is_ascii_uppercase() || character == '_')
+                {
                     continue;
                 }
 
-                if let Some(value) = assign.value.as_ref().and_then(|value| expr_string_value(value)) {
-                    settings.insert(name.id.clone(), value);
+                if let Some(value) = assign
+                    .value
+                    .as_ref()
+                    .and_then(|value| expr_string_value(value))
+                {
+                    settings.insert(name.id.to_string(), value);
                 }
             }
             _ => {}
@@ -714,13 +778,21 @@ fn extract_raw_class(
     let fields = class_def
         .body
         .iter()
-        .filter_map(|statement| extract_field(statement, module_name, &class_def.name.id, local_class_names, imports))
+        .filter_map(|statement| {
+            extract_field(
+                statement,
+                module_name,
+                &class_def.name.id,
+                local_class_names,
+                imports,
+            )
+        })
         .collect();
 
     RawClassInfo {
         id: ModelId::new(format!("{module_name}.{}", class_def.name.id)),
         module_name: module_name.to_string(),
-        class_name: class_def.name.id.clone(),
+        class_name: class_def.name.id.to_string(),
         bases,
         fields,
     }
@@ -744,7 +816,14 @@ fn extract_field(
                 _ => return None,
             };
 
-            extract_field_from_value(target_name, &assign.value, module_name, class_name, local_class_names, imports)
+            extract_field_from_value(
+                target_name,
+                &assign.value,
+                module_name,
+                class_name,
+                local_class_names,
+                imports,
+            )
         }
         Stmt::AnnAssign(assign) => {
             let target_name = match assign.target.as_ref() {
@@ -752,10 +831,16 @@ fn extract_field(
                 _ => return None,
             };
 
-            assign
-                .value
-                .as_ref()
-                .and_then(|value| extract_field_from_value(target_name, value, module_name, class_name, local_class_names, imports))
+            assign.value.as_ref().and_then(|value| {
+                extract_field_from_value(
+                    target_name,
+                    value,
+                    module_name,
+                    class_name,
+                    local_class_names,
+                    imports,
+                )
+            })
         }
         _ => None,
     }
@@ -779,10 +864,9 @@ fn extract_field_from_value(
     let kind = FieldKind::from_constructor_name(constructor_name)?;
 
     let relation_target = if RELATION_FIELD_NAMES.contains(&constructor_name) {
-        call.arguments
-            .args
-            .first()
-            .and_then(|target| extract_relation_target(target, module_name, class_name, local_class_names, imports))
+        call.arguments.args.first().and_then(|target| {
+            extract_relation_target(target, module_name, class_name, local_class_names, imports)
+        })
     } else {
         None
     };
@@ -803,14 +887,18 @@ fn extract_relation_target(
     imports: &HashMap<String, String>,
 ) -> Option<PendingRelationTarget> {
     match expr {
-        Expr::StringLiteral(string_literal) => Some(PendingRelationTarget::StringLiteral(string_literal.value.to_str().to_string())),
-        Expr::Attribute(attribute)
-            if matches!(attribute.value.as_ref(), Expr::Name(name) if name.id.as_str() == "settings") =>
-        {
-            Some(PendingRelationTarget::SettingsKey(attribute.attr.id.clone()))
+        Expr::StringLiteral(string_literal) => Some(PendingRelationTarget::StringLiteral(
+            string_literal.value.to_str().to_string(),
+        )),
+        Expr::Attribute(attribute) if matches!(attribute.value.as_ref(), Expr::Name(name) if name.id.as_str() == "settings") => {
+            Some(PendingRelationTarget::SettingsKey(
+                attribute.attr.id.to_string(),
+            ))
         }
-        Expr::Name(_) | Expr::Attribute(_) => qualify_expr(expr, module_name, local_class_names, imports)
-            .map(PendingRelationTarget::Qualified),
+        Expr::Name(_) | Expr::Attribute(_) => {
+            qualify_expr(expr, module_name, local_class_names, imports)
+                .map(PendingRelationTarget::Qualified)
+        }
         _ => {
             let _ = class_name;
             None
@@ -828,7 +916,10 @@ fn relation_query_name(
     }
 
     let related_name = keyword_string_value(keywords, "related_name");
-    if related_name.as_deref().is_some_and(|name| name.contains('+')) {
+    if related_name
+        .as_deref()
+        .is_some_and(|name| name.contains('+'))
+    {
         return None;
     }
 
@@ -871,7 +962,7 @@ pub fn qualify_expr(
             } else if local_class_names.contains(name.id.as_str()) {
                 Some(format!("{module_name}.{}", name.id))
             } else {
-                Some(name.id.clone())
+                Some(name.id.to_string())
             }
         }
         Expr::Attribute(attribute) => {
@@ -966,11 +1057,21 @@ pub fn infer_model_for_expression(
     local_bindings: &HashMap<String, ModelId>,
 ) -> Option<ModelId> {
     match expr {
-        Expr::Name(_) => resolve_model_reference_expr(expr, index, module_name, imports, local_bindings),
-        Expr::Attribute(attribute) if attribute.attr.as_str() == "objects" => {
-            infer_model_for_expression(&attribute.value, index, module_name, imports, local_bindings)
+        Expr::Name(_) => {
+            resolve_model_reference_expr(expr, index, module_name, imports, local_bindings)
         }
-        Expr::Attribute(_) => resolve_model_reference_expr(expr, index, module_name, imports, local_bindings),
+        Expr::Attribute(attribute) if attribute.attr.as_str() == "objects" => {
+            infer_model_for_expression(
+                &attribute.value,
+                index,
+                module_name,
+                imports,
+                local_bindings,
+            )
+        }
+        Expr::Attribute(_) => {
+            resolve_model_reference_expr(expr, index, module_name, imports, local_bindings)
+        }
         Expr::Call(call) => {
             let method = match call.func.as_ref() {
                 Expr::Attribute(attribute) => attribute,
@@ -978,7 +1079,13 @@ pub fn infer_model_for_expression(
             };
 
             if QUERYSET_PRESERVING_METHODS.contains(&method.attr.as_str()) {
-                infer_model_for_expression(&method.value, index, module_name, imports, local_bindings)
+                infer_model_for_expression(
+                    &method.value,
+                    index,
+                    module_name,
+                    imports,
+                    local_bindings,
+                )
             } else {
                 None
             }
@@ -999,7 +1106,11 @@ fn resolve_model_reference_expr(
             .get(name.id.as_str())
             .cloned()
             .or_else(|| index.resolve_model_symbol(module_name, name.id.as_str()))
-            .or_else(|| imports.get(name.id.as_str()).and_then(|qualified| index.resolve_qualified_model(qualified))),
+            .or_else(|| {
+                imports
+                    .get(name.id.as_str())
+                    .and_then(|qualified| index.resolve_qualified_model(qualified))
+            }),
         Expr::Attribute(_) => {
             let qualified = qualify_expr(expr, module_name, &HashSet::new(), imports)?;
             index.resolve_qualified_model(&qualified)
@@ -1022,7 +1133,15 @@ pub fn collect_visible_scope(
         if statement.range().start() > cursor {
             break;
         }
-        collect_scope_from_statement(statement, cursor, index, module_name, is_package, imports, bindings);
+        collect_scope_from_statement(
+            statement,
+            cursor,
+            index,
+            module_name,
+            is_package,
+            imports,
+            bindings,
+        );
     }
 }
 
@@ -1039,22 +1158,20 @@ fn collect_scope_from_statement(
         Stmt::Import(_) | Stmt::ImportFrom(_) if statement.range().end() <= cursor => {
             apply_import_statement(statement, module_name, is_package, imports);
         }
-        Stmt::Assign(assign) if assign.range.end() <= cursor => {
-            if assign.targets.len() == 1 {
-                if let Expr::Name(name) = &assign.targets[0] {
-                    if let Some(model_id) =
-                        infer_model_for_expression(&assign.value, index, module_name, imports, bindings)
-                    {
-                        bindings.insert(name.id.clone(), model_id);
-                    }
-                }
+        Stmt::Assign(assign) if assign.range.end() <= cursor && assign.targets.len() == 1 => {
+            if let Expr::Name(name) = &assign.targets[0]
+                && let Some(model_id) =
+                    infer_model_for_expression(&assign.value, index, module_name, imports, bindings)
+            {
+                bindings.insert(name.id.to_string(), model_id);
             }
         }
         Stmt::AnnAssign(assign) if assign.range.end() <= cursor => {
-            if let (Expr::Name(name), Some(value)) = (assign.target.as_ref(), assign.value.as_ref()) {
-                if let Some(model_id) = infer_model_for_expression(value, index, module_name, imports, bindings) {
-                    bindings.insert(name.id.clone(), model_id);
-                }
+            if let (Expr::Name(name), Some(value)) = (assign.target.as_ref(), assign.value.as_ref())
+                && let Some(model_id) =
+                    infer_model_for_expression(value, index, module_name, imports, bindings)
+            {
+                bindings.insert(name.id.to_string(), model_id);
             }
         }
         Stmt::If(if_stmt) => {
@@ -1229,11 +1346,17 @@ class Blog(models.Model):
         let blog = index.model(&ModelId::new("blog.models.Blog")).unwrap();
         let author = blog.field("author").unwrap();
         assert_eq!(author.kind, FieldKind::ForeignKey);
-        assert_eq!(author.related_model.as_ref().unwrap().as_str(), "blog.models.Author");
+        assert_eq!(
+            author.related_model.as_ref().unwrap().as_str(),
+            "blog.models.Author"
+        );
 
         let author_model = index.model(author.related_model.as_ref().unwrap()).unwrap();
         let team = author_model.field("team").unwrap();
-        assert_eq!(team.related_model.as_ref().unwrap().as_str(), "blog.models.Team");
+        assert_eq!(
+            team.related_model.as_ref().unwrap().as_str(),
+            "blog.models.Team"
+        );
     }
 
     #[test]
@@ -1263,9 +1386,33 @@ from .models import Blog as Post
         let index = build_index(dir.path());
         let module = index.module_for_path(&app_dir.join("views.py")).unwrap();
         assert_eq!(
-            index.resolve_model_symbol_in_module(module, "Post").unwrap().as_str(),
+            index
+                .resolve_model_symbol_in_module(module, "Post")
+                .unwrap()
+                .as_str(),
             "blog.models.Blog"
         );
+    }
+
+    #[test]
+    fn detects_models_with_unaliased_dotted_imports() {
+        let dir = tempdir().unwrap();
+        let app_dir = dir.path().join("blog");
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::write(
+            app_dir.join("models.py"),
+            r#"
+import django.db.models
+
+class Blog(django.db.models.Model):
+    title = django.db.models.CharField(max_length=255)
+"#,
+        )
+        .unwrap();
+
+        let index = build_index(dir.path());
+        let blog = index.model(&ModelId::new("blog.models.Blog")).unwrap();
+        assert!(blog.field("title").is_some());
     }
 
     #[test]
@@ -1303,8 +1450,129 @@ class Route(models.Model):
         assert!(index.model(&ModelId::new("core.models.User")).is_some());
         let route = index.model(&ModelId::new("core.models.Route")).unwrap();
         assert_eq!(
-            route.field("installer").unwrap().related_model.as_ref().unwrap().as_str(),
+            route
+                .field("installer")
+                .unwrap()
+                .related_model
+                .as_ref()
+                .unwrap()
+                .as_str(),
             "core.models.User"
+        );
+    }
+
+    #[test]
+    fn ignores_settings_names_from_unrelated_modules() {
+        let dir = tempdir().unwrap();
+        for package in ["config", "core", "zzz"] {
+            let package_dir = dir.path().join(package);
+            fs::create_dir_all(&package_dir).unwrap();
+            fs::write(package_dir.join("__init__.py"), "").unwrap();
+        }
+        fs::write(
+            dir.path().join("config/settings.py"),
+            "AUTH_USER_MODEL = 'core.User'\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("zzz/constants.py"),
+            "AUTH_USER_MODEL = 'zzz.OtherUser'\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("core/models.py"),
+            r#"
+from django.conf import settings
+from django.contrib.auth.models import AbstractUser
+from django.db import models
+
+class User(AbstractUser):
+    email = models.EmailField()
+
+class Route(models.Model):
+    installer = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("zzz/models.py"),
+            r#"
+from django.contrib.auth.models import AbstractUser
+from django.db import models
+
+class OtherUser(AbstractUser):
+    nickname = models.CharField(max_length=32)
+"#,
+        )
+        .unwrap();
+
+        let index = build_index(dir.path());
+        let route = index.model(&ModelId::new("core.models.Route")).unwrap();
+        assert_eq!(
+            route
+                .field("installer")
+                .unwrap()
+                .related_model
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "core.models.User"
+        );
+    }
+
+    #[test]
+    fn supports_an_explicit_settings_module() {
+        let dir = tempdir().unwrap();
+        let project_dir = dir.path().join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("settings.py"),
+            "AUTH_USER_MODEL = 'core.DefaultUser'\n",
+        )
+        .unwrap();
+        fs::write(
+            project_dir.join("production.py"),
+            "AUTH_USER_MODEL = 'core.ProductionUser'\n",
+        )
+        .unwrap();
+
+        let config = DjangoLspConfig {
+            settings_module: Some("project.production".to_string()),
+            ..DjangoLspConfig::default()
+        };
+        let index = WorkspaceIndex::build(dir.path(), config, &DocumentStore::default()).unwrap();
+
+        assert_eq!(
+            index.setting("AUTH_USER_MODEL"),
+            Some("core.ProductionUser")
+        );
+    }
+
+    #[test]
+    fn excludes_nested_environment_directories() {
+        let dir = tempdir().unwrap();
+        let app_dir = dir.path().join("app");
+        let environment_dir = dir.path().join("nested/venv/ghost");
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::create_dir_all(&environment_dir).unwrap();
+        fs::write(
+            app_dir.join("models.py"),
+            "from django.db import models\nclass Real(models.Model):\n    name = models.CharField()\n",
+        )
+        .unwrap();
+        fs::write(
+            environment_dir.join("models.py"),
+            "from django.db import models\nclass Ghost(models.Model):\n    name = models.CharField()\n",
+        )
+        .unwrap();
+
+        let index = build_index(dir.path());
+        assert!(index.model(&ModelId::new("app.models.Real")).is_some());
+        assert!(
+            index
+                .models
+                .values()
+                .all(|model| model.class_name != "Ghost")
         );
     }
 }

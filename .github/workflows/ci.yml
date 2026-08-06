@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust quality suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Check generated documentation
+        run: cargo run --bin render-docs -- --check
+      - name: Run tests
+        run: cargo test --all-targets
+
+  django:
+    name: Django ${{ matrix.django }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        django: ["5.2", "6.0", "6.1"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Django
+        run: python -m pip install "Django~=${{ matrix.django }}.0"
+      - name: Validate Django fixture
+        working-directory: tests/fixtures/django_project
+        run: |
+          python manage.py check
+          python manage.py test
+      - name: Run LSP protocol tests
+        run: cargo test --test lsp_protocol

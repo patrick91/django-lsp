@@ -2,13 +2,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
-use tower_lsp::jsonrpc::Result;
-use tower_lsp::lsp_types::{
+use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::ls_types::{
     CompletionOptions, CompletionResponse, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, InitializeParams, InitializeResult, InitializedParams, MessageType,
     ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
 };
-use tower_lsp::{Client, LanguageServer};
+use tower_lsp_server::{Client, LanguageServer};
 use tracing::warn;
 
 use crate::completion::complete_lsp_items;
@@ -28,23 +28,12 @@ pub struct ServerState {
     inner: RwLock<ServerSnapshot>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct ServerSnapshot {
     workspace_root: Option<PathBuf>,
     config: DjangoLspConfig,
     documents: DocumentStore,
     index: WorkspaceIndex,
-}
-
-impl Default for ServerSnapshot {
-    fn default() -> Self {
-        Self {
-            workspace_root: None,
-            config: DjangoLspConfig::default(),
-            documents: DocumentStore::default(),
-            index: WorkspaceIndex::default(),
-        }
-    }
 }
 
 impl Backend {
@@ -74,33 +63,41 @@ impl Backend {
             Err(error) => {
                 warn!("index rebuild failed: {error}");
                 self.client
-                    .log_message(MessageType::ERROR, format!("django-lsp failed to refresh index: {error}"))
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("django-lsp failed to refresh index: {error}"),
+                    )
                     .await;
             }
         }
     }
 
+    #[allow(deprecated)]
     fn workspace_root_from_initialize(params: &InitializeParams) -> Option<PathBuf> {
         params
-            .root_uri
+            .workspace_folders
             .as_ref()
-            .and_then(|uri| uri.to_file_path().ok())
+            .and_then(|folders| folders.first())
+            .and_then(|folder| folder.uri.to_file_path())
+            .map(|path| path.into_owned())
             .or_else(|| {
                 params
-                    .workspace_folders
+                    .root_uri
                     .as_ref()
-                    .and_then(|folders| folders.first())
-                    .and_then(|folder| folder.uri.to_file_path().ok())
+                    .and_then(|uri| uri.to_file_path())
+                    .map(|path| path.into_owned())
             })
     }
 
-    fn path_from_uri(uri: &tower_lsp::lsp_types::Url) -> std::result::Result<PathBuf, DjangoLspError> {
+    fn path_from_uri(
+        uri: &tower_lsp_server::ls_types::Uri,
+    ) -> std::result::Result<PathBuf, DjangoLspError> {
         uri.to_file_path()
-            .map_err(|_| DjangoLspError::InvalidFileUri(uri.to_string()))
+            .map(|path| path.into_owned())
+            .ok_or_else(|| DjangoLspError::InvalidFileUri(uri.to_string()))
     }
 }
 
-#[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         let workspace_root = Self::workspace_root_from_initialize(&params);
@@ -111,7 +108,10 @@ impl LanguageServer for Backend {
         };
         let index = workspace_root
             .as_ref()
-            .and_then(|workspace_root| WorkspaceIndex::build(workspace_root, config.clone(), &DocumentStore::default()).ok())
+            .and_then(|workspace_root| {
+                WorkspaceIndex::build(workspace_root, config.clone(), &DocumentStore::default())
+                    .ok()
+            })
             .unwrap_or_else(|| {
                 WorkspaceIndex::empty(
                     workspace_root.clone().unwrap_or_else(|| PathBuf::from(".")),
@@ -126,7 +126,9 @@ impl LanguageServer for Backend {
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+                text_document_sync: Some(TextDocumentSyncCapability::Kind(
+                    TextDocumentSyncKind::FULL,
+                )),
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec!["_".to_string()]),
                     ..CompletionOptions::default()
@@ -154,9 +156,11 @@ impl LanguageServer for Backend {
 
         {
             let mut snapshot = self.state.inner.write().await;
-            snapshot
-                .documents
-                .open(path, params.text_document.version, params.text_document.text);
+            snapshot.documents.open(
+                path,
+                params.text_document.version,
+                params.text_document.text,
+            );
         }
 
         self.rebuild_index().await;
@@ -172,7 +176,9 @@ impl LanguageServer for Backend {
 
         {
             let mut snapshot = self.state.inner.write().await;
-            snapshot.documents.update(path, params.text_document.version, change.text);
+            snapshot
+                .documents
+                .update(path, params.text_document.version, change.text);
         }
 
         self.rebuild_index().await;
@@ -193,7 +199,7 @@ impl LanguageServer for Backend {
 
     async fn completion(
         &self,
-        params: tower_lsp::lsp_types::CompletionParams,
+        params: tower_lsp_server::ls_types::CompletionParams,
     ) -> Result<Option<CompletionResponse>> {
         let Ok(path) = Self::path_from_uri(&params.text_document_position.text_document.uri) else {
             return Ok(None);
@@ -218,7 +224,7 @@ impl LanguageServer for Backend {
     }
 }
 
-fn position_to_offset(source: &str, position: tower_lsp::lsp_types::Position) -> usize {
+fn position_to_offset(source: &str, position: tower_lsp_server::ls_types::Position) -> usize {
     let mut line = 0u32;
     let mut column = 0u32;
     let mut offset = 0usize;
@@ -249,4 +255,24 @@ fn position_to_offset(source: &str, position: tower_lsp::lsp_types::Position) ->
     }
 
     offset
+}
+
+#[cfg(test)]
+mod tests {
+    use tower_lsp_server::ls_types::Position;
+
+    use super::position_to_offset;
+
+    #[test]
+    fn converts_utf16_positions_to_byte_offsets() {
+        let source = "a😀b\ncafé";
+
+        assert_eq!(position_to_offset(source, Position::new(0, 0)), 0);
+        assert_eq!(position_to_offset(source, Position::new(0, 1)), 1);
+        assert_eq!(position_to_offset(source, Position::new(0, 3)), 5);
+        assert_eq!(
+            position_to_offset(source, Position::new(1, 4)),
+            source.len()
+        );
+    }
 }
