@@ -57,11 +57,23 @@ jobs:
         run: |
           uv tool install --force dist/*.whl
           python -c 'import os, pathlib, subprocess; executable = pathlib.Path(subprocess.check_output(["uv", "tool", "dir", "--bin"], text=True).strip()) / ("django-lsp.exe" if os.name == "nt" else "django-lsp"); subprocess.run([executable, "--version"], check=True)'
+      - name: Prepare and run extension binary
+        env:
+          TARGET: ${{ matrix.platform.target }}
+        shell: bash
+        run: |
+          python -c 'import os, pathlib, shutil, subprocess; suffix = ".exe" if os.name == "nt" else ""; target = os.environ["TARGET"]; source = pathlib.Path(subprocess.check_output(["uv", "tool", "dir", "--bin"], text=True).strip()) / f"django-lsp{suffix}"; destination = pathlib.Path("dist") / f"django-lsp-{target}{suffix}"; shutil.copy2(source, destination); subprocess.run([destination.resolve(), "--version"], check=True)'
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.platform.target }}
           path: dist/*.whl
+          if-no-files-found: error
+      - name: Upload extension binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.platform.target }}
+          path: dist/django-lsp-${{ matrix.platform.target }}*
           if-no-files-found: error
 
   github-release:
@@ -77,15 +89,21 @@ jobs:
           pattern: wheels-*
           path: dist
           merge-multiple: true
+      - name: Download extension binaries
+        uses: actions/download-artifact@v5
+        with:
+          pattern: binaries-*
+          path: dist
+          merge-multiple: true
       - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/*.whl --clobber
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
           else
-            gh release create "$GITHUB_REF_NAME" dist/*.whl --generate-notes --verify-tag
+            gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag
           fi
 
   pypi:

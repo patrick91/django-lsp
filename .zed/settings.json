@@ -1,16 +1,8 @@
 {
   "languages": {
     "Python": {
-      "language_servers": ["pylsp"],
+      "language_servers": ["django-lsp", "..."],
       "show_completions_on_input": true
-    }
-  },
-  "lsp": {
-    "pylsp": {
-      "binary": {
-        "path": "/Users/patrick/github/patrick91/django-lsp/target/debug/django-lsp",
-        "arguments": []
-      }
     }
   }
 }

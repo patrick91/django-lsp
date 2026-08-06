@@ -28,6 +28,13 @@ django-lsp --version
 Point an editor's LSP client at the `django-lsp` command, with no arguments. The server uses standard
 input and output for LSP communication.
 
+### Zed
+
+The repository includes a [Zed extension](extensions/zed-extension) that registers `django-lsp`
+alongside a general Python language server. It uses a server already installed on `PATH`, or
+downloads the matching executable from the latest GitHub release. See the extension README for
+development installation while its extension-gallery submission is in progress.
+
 ## Documentation
 
 - [Getting started](docs/getting-started.md) covers installing, building, and connecting an editor.

@@ -1,0 +1,14 @@
+[package]
+name = "zed-django-lsp"
+version = "0.1.0"
+edition = "2021"
+authors = ["Patrick Arminio"]
+repository = "https://github.com/patrick91/django-lsp"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zed_extension_api = "0.7.0"

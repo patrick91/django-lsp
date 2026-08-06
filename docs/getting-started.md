@@ -50,6 +50,29 @@ Configure a Python language-server entry with:
 The server writes diagnostics and lifecycle logging to standard error so standard output remains a
 valid LSP stream.
 
+### Zed
+
+The first-party [Zed extension](../extensions/zed-extension) attaches `django-lsp` to Python files
+without replacing Pyright, Pylsp, Ruff, or another general Python language server. Until the
+extension is available in Zed's gallery, clone this repository and run **zed: install dev
+extension**, selecting `extensions/zed-extension`.
+
+Enable it alongside the rest of your Python language servers:
+
+```json
+{
+  "languages": {
+    "Python": {
+      "language_servers": ["django-lsp", "..."]
+    }
+  }
+}
+```
+
+The `"..."` entry preserves other registered Python language servers. The extension first checks
+for `django-lsp` on `PATH`; otherwise it downloads the executable matching the current platform
+from the latest GitHub release.
+
 After the client initializes the server, open a Python file in the workspace and request completion
 inside a Django `filter`, `exclude`, or `get` call:
 
