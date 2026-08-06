@@ -8,9 +8,11 @@ rust-version = "1.95"
 globset = "0.4.20"
 ignore = "0.4.33"
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 thiserror = "2.0.19"
 tokio = { version = "1.53.1", features = ["io-std", "macros", "rt-multi-thread", "sync"] }
 toml = "1.1.4"
+tower = { version = "0.5.3", features = ["util"] }
 tower-lsp-server = "0.23.0"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
@@ -20,6 +22,4 @@ ruff_python_parser = { git = "https://github.com/astral-sh/ruff.git", tag = "0.1
 ruff_text_size = { git = "https://github.com/astral-sh/ruff.git", tag = "0.16.0" }
 
 [dev-dependencies]
-serde_json = "1.0.151"
 tempfile = "3.27.0"
-tower = { version = "0.5.3", features = ["util"] }
