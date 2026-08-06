@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use django_lsp::server::{Backend, ServerState};
 use tokio::io::{stdin, stdout};
-use tower_lsp::{LspService, Server};
+use tower_lsp_server::{LspService, Server};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -12,6 +12,7 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
-    let (service, socket) = LspService::new(|client| Backend::new(client, Arc::new(ServerState::default())));
+    let (service, socket) =
+        LspService::new(|client| Backend::new(client, Arc::new(ServerState::default())));
     Server::new(stdin(), stdout(), socket).serve(service).await;
 }

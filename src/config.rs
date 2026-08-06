@@ -10,6 +10,7 @@ pub struct DjangoLspConfig {
     pub include: Vec<String>,
     pub exclude: Vec<String>,
     pub workspace_root: Option<PathBuf>,
+    pub settings_module: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -28,6 +29,7 @@ struct RawDjangoLspConfig {
     include: Option<Vec<String>>,
     exclude: Option<Vec<String>>,
     workspace_root: Option<String>,
+    settings_module: Option<String>,
 }
 
 impl DjangoLspConfig {
@@ -39,8 +41,8 @@ impl DjangoLspConfig {
 
         let contents = fs::read_to_string(&pyproject_path)
             .map_err(|source| DjangoLspError::io(pyproject_path.display().to_string(), source))?;
-        let parsed: PyProject =
-            toml::from_str(&contents).map_err(|source| DjangoLspError::toml(pyproject_path.display().to_string(), source))?;
+        let parsed: PyProject = toml::from_str(&contents)
+            .map_err(|source| DjangoLspError::toml(pyproject_path.display().to_string(), source))?;
 
         let Some(raw) = parsed.tool.and_then(|tool| tool.django_lsp) else {
             return Ok(Self::default());
@@ -50,6 +52,7 @@ impl DjangoLspConfig {
             include: raw.include.unwrap_or_default(),
             exclude: raw.exclude.unwrap_or_default(),
             workspace_root: raw.workspace_root.map(PathBuf::from),
+            settings_module: raw.settings_module,
         })
     }
 
@@ -64,5 +67,40 @@ impl DjangoLspConfig {
                 }
             })
             .unwrap_or_else(|| workspace_root.to_path_buf())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn loads_project_configuration() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("pyproject.toml"),
+            r#"
+[tool.django-lsp]
+include = ["apps/**"]
+exclude = ["generated/**"]
+workspace_root = "src"
+settings_module = "project.production"
+"#,
+        )
+        .unwrap();
+
+        let config = DjangoLspConfig::load(dir.path()).unwrap();
+        assert_eq!(config.include, ["apps/**"]);
+        assert_eq!(config.exclude, ["generated/**"]);
+        assert_eq!(config.workspace_root.as_deref(), Some(Path::new("src")));
+        assert_eq!(
+            config.settings_module.as_deref(),
+            Some("project.production")
+        );
+        assert_eq!(config.effective_root(dir.path()), dir.path().join("src"));
     }
 }

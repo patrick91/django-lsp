@@ -2,10 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use ruff_python_parser::parse_expression;
-use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, CompletionTextEdit, Range, TextEdit};
+use tower_lsp_server::ls_types::{
+    CompletionItem, CompletionItemKind, CompletionTextEdit, Range, TextEdit,
+};
 
 use crate::index::{
-    analyze_source, collect_visible_scope, infer_model_for_expression, FieldInfo, ModelId, WorkspaceIndex,
+    FieldInfo, ModelId, WorkspaceIndex, analyze_source, collect_visible_scope,
+    infer_model_for_expression,
 };
 
 const QUERY_METHODS: &[&str] = &["filter", "exclude", "get"];
@@ -108,7 +111,11 @@ pub fn complete_lsp_items(
         .collect()
 }
 
-fn build_candidates(index: &WorkspaceIndex, root_model_id: &ModelId, token: &str) -> Vec<CompletionCandidate> {
+fn build_candidates(
+    index: &WorkspaceIndex,
+    root_model_id: &ModelId,
+    token: &str,
+) -> Vec<CompletionCandidate> {
     let Some(root_model) = index.model(root_model_id) else {
         return Vec::new();
     };
@@ -145,40 +152,37 @@ fn build_candidates(index: &WorkspaceIndex, root_model_id: &ModelId, token: &str
         }
     }
 
-    let mut seen = HashSet::new();
-    let mut candidates = Vec::new();
     let context_chain = chain_parts.join("__");
+    let context = CandidateContext {
+        index,
+        typed_token: token,
+        context_chain: &context_chain,
+    };
+    let mut output = CandidateOutput::default();
 
     match last_field {
         Some(field) if field.related_model.is_none() => {
             add_lookup_candidates(
-                &mut candidates,
-                &mut seen,
+                &mut output,
                 &context_chain,
                 field.supported_lookups,
-                token,
                 field.name.as_str(),
                 false,
-                &context_chain,
+                &context,
             );
         }
         Some(field) if field.related_model.is_some() => {
             add_relation_lookup_candidates(
-                &mut candidates,
-                &mut seen,
+                &mut output,
                 &context_chain,
-                token,
                 field.name.as_str(),
-                &context_chain,
+                &context,
             );
             let mut visited = HashSet::from([current_model.id.clone()]);
             add_descendant_candidates(
-                &mut candidates,
-                &mut seen,
-                index,
+                &mut output,
+                &context,
                 current_model,
-                token,
-                &context_chain,
                 &context_chain,
                 0,
                 &mut visited,
@@ -186,55 +190,47 @@ fn build_candidates(index: &WorkspaceIndex, root_model_id: &ModelId, token: &str
         }
         None => {
             let mut visited = HashSet::from([current_model.id.clone()]);
-            add_descendant_candidates(
-                &mut candidates,
-                &mut seen,
-                index,
-                current_model,
-                token,
-                "",
-                "",
-                0,
-                &mut visited,
-            );
+            add_descendant_candidates(&mut output, &context, current_model, "", 0, &mut visited);
         }
         Some(_) => {}
     }
 
-    candidates.sort_by(|left, right| {
+    output.candidates.sort_by(|left, right| {
         left.sort_group
             .cmp(&right.sort_group)
             .then_with(|| left.sort_rank.cmp(&right.sort_rank))
             .then_with(|| left.filter_text.len().cmp(&right.filter_text.len()))
             .then_with(|| left.filter_text.cmp(&right.filter_text))
     });
-    candidates
+    output.candidates
+}
+
+#[derive(Default)]
+struct CandidateOutput {
+    candidates: Vec<CompletionCandidate>,
+    seen: HashSet<String>,
+}
+
+struct CandidateContext<'a> {
+    index: &'a WorkspaceIndex,
+    typed_token: &'a str,
+    context_chain: &'a str,
 }
 
 fn add_descendant_candidates(
-    candidates: &mut Vec<CompletionCandidate>,
-    seen: &mut HashSet<String>,
-    index: &WorkspaceIndex,
+    output: &mut CandidateOutput,
+    context: &CandidateContext<'_>,
     model: &crate::index::ModelInfo,
-    typed_token: &str,
-    context_chain: &str,
     prefix_chain: &str,
     relation_depth: usize,
     visited: &mut HashSet<ModelId>,
 ) {
     for field in &model.fields {
         let full_path = join_chain(prefix_chain, &field.name);
-        add_field_candidate(candidates, seen, model, &field.name, &full_path, typed_token, context_chain);
+        add_field_candidate(output, model, &field.name, &full_path, context);
 
         if field.related_model.is_some() {
-            add_relation_lookup_candidates(
-                candidates,
-                seen,
-                &full_path,
-                typed_token,
-                field.name.as_str(),
-                context_chain,
-            );
+            add_relation_lookup_candidates(output, &full_path, field.name.as_str(), context);
 
             if relation_depth >= MAX_COMPLETION_RELATION_DEPTH {
                 continue;
@@ -247,14 +243,11 @@ fn add_descendant_candidates(
                 continue;
             }
 
-            if let Some(next_model) = index.model(related_model) {
+            if let Some(next_model) = context.index.model(related_model) {
                 add_descendant_candidates(
-                    candidates,
-                    seen,
-                    index,
+                    output,
+                    context,
                     next_model,
-                    typed_token,
-                    context_chain,
                     &full_path,
                     relation_depth + 1,
                     visited,
@@ -263,36 +256,32 @@ fn add_descendant_candidates(
             visited.remove(related_model);
         } else {
             add_lookup_candidates(
-                candidates,
-                seen,
+                output,
                 &full_path,
                 field.supported_lookups,
-                typed_token,
                 field.name.as_str(),
                 false,
-                context_chain,
+                context,
             );
         }
     }
 }
 
 fn add_field_candidate(
-    candidates: &mut Vec<CompletionCandidate>,
-    seen: &mut HashSet<String>,
+    output: &mut CandidateOutput,
     model: &crate::index::ModelInfo,
     field_name: &str,
     full_path: &str,
-    typed_token: &str,
-    context_chain: &str,
+    context: &CandidateContext<'_>,
 ) {
-    if !full_path.starts_with(typed_token) {
+    if !full_path.starts_with(context.typed_token) {
         return;
     }
 
-    if seen.insert(full_path.to_string()) {
-        candidates.push(CompletionCandidate {
+    if output.seen.insert(full_path.to_string()) {
+        output.candidates.push(CompletionCandidate {
             label: field_name.to_string(),
-            insert_text: completion_insert_text(full_path, context_chain),
+            insert_text: completion_insert_text(full_path, context.context_chain),
             filter_text: full_path.to_string(),
             detail: format!("field on {}", model.class_name),
             kind: CompletionItemKind::FIELD,
@@ -303,47 +292,41 @@ fn add_field_candidate(
 }
 
 fn add_relation_lookup_candidates(
-    candidates: &mut Vec<CompletionCandidate>,
-    seen: &mut HashSet<String>,
+    output: &mut CandidateOutput,
     prefix_chain: &str,
-    typed_token: &str,
     field_name: &str,
-    context_chain: &str,
+    context: &CandidateContext<'_>,
 ) {
     add_lookup_candidates(
-        candidates,
-        seen,
+        output,
         prefix_chain,
         RELATION_LOOKUPS,
-        typed_token,
         field_name,
         true,
-        context_chain,
+        context,
     );
 }
 
 fn add_lookup_candidates(
-    candidates: &mut Vec<CompletionCandidate>,
-    seen: &mut HashSet<String>,
+    output: &mut CandidateOutput,
     prefix_chain: &str,
     supported_lookups: &[&str],
-    typed_token: &str,
     field_name: &str,
     relation_lookup: bool,
-    context_chain: &str,
+    context: &CandidateContext<'_>,
 ) {
     for (rank, lookup) in supported_lookups.iter().enumerate() {
         let filter_text = format!("{prefix_chain}__{lookup}");
-        if !filter_text.starts_with(typed_token) {
+        if !filter_text.starts_with(context.typed_token) {
             continue;
         }
 
         let label = (*lookup).to_string();
 
-        if seen.insert(filter_text.clone()) {
-            candidates.push(CompletionCandidate {
+        if output.seen.insert(filter_text.clone()) {
+            output.candidates.push(CompletionCandidate {
                 label,
-                insert_text: completion_insert_text(&filter_text, context_chain),
+                insert_text: completion_insert_text(&filter_text, context.context_chain),
                 filter_text,
                 detail: if relation_lookup {
                     format!("relation lookup on {field_name}")
@@ -524,7 +507,7 @@ fn offsets_to_range(source: &str, start: usize, end: usize) -> Range {
     }
 }
 
-fn offset_to_position(source: &str, offset: usize) -> tower_lsp::lsp_types::Position {
+fn offset_to_position(source: &str, offset: usize) -> tower_lsp_server::ls_types::Position {
     let mut line = 0u32;
     let mut column = 0u32;
     let mut seen = 0usize;
@@ -547,7 +530,7 @@ fn offset_to_position(source: &str, offset: usize) -> tower_lsp::lsp_types::Posi
         seen += len;
     }
 
-    tower_lsp::lsp_types::Position::new(line, column)
+    tower_lsp_server::ls_types::Position::new(line, column)
 }
 
 #[cfg(test)]
@@ -571,7 +554,12 @@ mod tests {
             fs::write(path, contents).unwrap();
         }
 
-        let index = WorkspaceIndex::build(dir.path(), DjangoLspConfig::default(), &DocumentStore::default()).unwrap();
+        let index = WorkspaceIndex::build(
+            dir.path(),
+            DjangoLspConfig::default(),
+            &DocumentStore::default(),
+        )
+        .unwrap();
         (dir, index)
     }
 
@@ -854,7 +842,8 @@ Team.objects.filter(auth)
             "from django.db import models\n\nclass Blog(models.Model):\n    title = models.CharField(max_length=255)\n    new_field = models.IntegerField()\n".to_string(),
         );
 
-        let index = WorkspaceIndex::build(dir.path(), DjangoLspConfig::default(), &documents).unwrap();
+        let index =
+            WorkspaceIndex::build(dir.path(), DjangoLspConfig::default(), &documents).unwrap();
         let source = fs::read_to_string(dir.path().join("blog/views.py")).unwrap();
         let cursor = source.find("ne)").unwrap() + 2;
         let items = complete(&index, &dir.path().join("blog/views.py"), &source, cursor);
@@ -864,10 +853,7 @@ Team.objects.filter(auth)
     #[test]
     fn completes_auth_user_model_relations() {
         let (dir, index) = fixture_index(&[
-            (
-                "config/settings.py",
-                "AUTH_USER_MODEL = 'core.User'\n",
-            ),
+            ("config/settings.py", "AUTH_USER_MODEL = 'core.User'\n"),
             (
                 "core/models.py",
                 r#"
@@ -959,6 +945,34 @@ def run():
     }
 
     #[test]
+    fn completes_unaliased_dotted_imports() {
+        let (dir, index) = fixture_index(&[
+            (
+                "blog/models.py",
+                r#"
+from django.db import models
+
+class Blog(models.Model):
+    title = models.CharField(max_length=255)
+"#,
+            ),
+            (
+                "blog/views.py",
+                r#"
+def run():
+    import blog.models
+    blog.models.Blog.objects.filter(ti)
+"#,
+            ),
+        ]);
+
+        let source = fs::read_to_string(dir.path().join("blog/views.py")).unwrap();
+        let cursor = source.find("ti)").unwrap() + 2;
+        let items = complete(&index, &dir.path().join("blog/views.py"), &source, cursor);
+        assert!(labels(items).contains(&"title".to_string()));
+    }
+
+    #[test]
     fn lsp_items_keep_full_filter_text_for_lookup_suffixes() {
         let (dir, index) = fixture_index(&[
             (
@@ -983,7 +997,10 @@ Blog.objects.filter(notes__)
         let source = fs::read_to_string(dir.path().join("blog/views.py")).unwrap();
         let cursor = source.find("notes__)").unwrap() + "notes__".len();
         let items = complete_lsp_items(&index, &dir.path().join("blog/views.py"), &source, cursor);
-        let exact = items.into_iter().find(|item| item.label == "notes__exact").unwrap();
+        let exact = items
+            .into_iter()
+            .find(|item| item.label == "notes__exact")
+            .unwrap();
 
         assert_eq!(exact.filter_text.as_deref(), Some("notes__exact"));
         let edit = match exact.text_edit.unwrap() {
