@@ -486,17 +486,45 @@ impl WorkspaceIndex {
         local_name: &str,
     ) -> Option<ModelId> {
         module.model_names.get(local_name).cloned().or_else(|| {
-            module
-                .imports
-                .get(local_name)
-                .and_then(|qualified| self.resolve_qualified_model(qualified))
+            module.imports.get(local_name).and_then(|qualified| {
+                self.resolve_qualified_model_inner(qualified, &mut HashSet::new())
+            })
         })
     }
 
     pub fn resolve_qualified_model(&self, qualified: &str) -> Option<ModelId> {
+        self.resolve_qualified_model_inner(qualified, &mut HashSet::new())
+    }
+
+    fn resolve_qualified_model_inner(
+        &self,
+        qualified: &str,
+        visited: &mut HashSet<String>,
+    ) -> Option<ModelId> {
         let candidate = ModelId::new(qualified.to_string());
         if self.models.contains_key(&candidate) {
             return Some(candidate);
+        }
+
+        if !visited.insert(qualified.to_string()) {
+            return None;
+        }
+
+        if let Some((module_name, local_name)) = qualified.rsplit_once('.')
+            && let Some(module) = self
+                .modules
+                .values()
+                .find(|module| module.module_name == module_name)
+        {
+            if let Some(model_id) = module.model_names.get(local_name) {
+                return Some(model_id.clone());
+            }
+
+            if let Some(reexported) = module.imports.get(local_name)
+                && let Some(model_id) = self.resolve_qualified_model_inner(reexported, visited)
+            {
+                return Some(model_id);
+            }
         }
 
         if let Some((app_label, class_name)) = qualified.split_once('.') {

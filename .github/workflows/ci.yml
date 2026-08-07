@@ -13,7 +13,7 @@ jobs:
     name: Rust quality suite
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -34,8 +34,8 @@ jobs:
       matrix:
         django: ["5.2", "6.0", "6.1"]
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
@@ -53,7 +53,7 @@ jobs:
     name: Zed extension
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -64,3 +64,29 @@ jobs:
         run: cargo clippy --locked --target wasm32-wasip1 --manifest-path extensions/zed-extension/Cargo.toml -- -D warnings
       - name: Check extension
         run: cargo check --locked --target wasm32-wasip1 --manifest-path extensions/zed-extension/Cargo.toml
+
+  vscode-extension:
+    name: VS Code extension
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: extensions/vscode-extension
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: extensions/vscode-extension/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Check extension
+        run: npm run check
+      - name: Package universal development VSIX
+        run: npm run package:universal
+      - name: Upload universal development VSIX
+        uses: actions/upload-artifact@v7
+        with:
+          name: vscode-extension-universal
+          path: extensions/vscode-extension/dist/django-lsp-universal.vsix
+          if-no-files-found: error
