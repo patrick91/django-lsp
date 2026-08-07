@@ -44,6 +44,26 @@ If VS Code does not inherit the shell's `PATH`, configure the absolute path:
 Use **django-lsp: Restart Django ORM Language Server** after changing the executable. The
 `djangoLsp.trace.server` setting enables protocol tracing for troubleshooting.
 
+## Monorepos and multi-root workspaces
+
+The extension starts one language server for each detected Django project instead of attaching the
+whole editor to the first workspace folder. For every opened Python file it looks upward, without
+leaving that file's workspace folder, for:
+
+1. `manage.py`
+2. `pyproject.toml`
+3. the workspace folder itself as a fallback
+
+Override detection per workspace folder when a project uses another layout:
+
+```json
+{
+  "djangoLsp.workspaceRoot": "backend"
+}
+```
+
+Relative values resolve from the containing workspace folder; absolute paths are also supported.
+
 ## Development
 
 Run the TypeScript tests, type checker, and production bundler:

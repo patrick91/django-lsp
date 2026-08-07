@@ -57,6 +57,7 @@ development installation while its extension-gallery submission is in progress.
 - completion inside `filter(...)`, `exclude(...)`, and `get(...)`
 - forward, reverse, and recursive relation traversal
 - `AUTH_USER_MODEL` support
+- models re-exported from package `__init__.py` modules
 - function-local and dotted import resolution
 - unsaved editor buffer updates
 

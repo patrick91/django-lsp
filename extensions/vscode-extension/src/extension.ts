@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import * as vscode from "vscode";
 import {
   LanguageClient,
@@ -6,6 +7,7 @@ import {
 } from "vscode-languageclient/node";
 
 import { resolveServer, type ServerSource } from "./server-path";
+import { resolveWorkspaceRoot } from "./workspace-root";
 
 const CLIENT_ID = "djangoLsp";
 const CLIENT_NAME = "Django ORM Language Server";
@@ -13,7 +15,7 @@ const INSTALLATION_GUIDE = vscode.Uri.parse(
   "https://github.com/patrick91/django-lsp/tree/main/extensions/vscode-extension#server-resolution",
 );
 
-let client: LanguageClient | undefined;
+const clients = new Map<string, LanguageClient>();
 let outputChannel: vscode.LogOutputChannel | undefined;
 let lifecycle = Promise.resolve();
 
@@ -46,72 +48,118 @@ async function showStartupError(error: unknown): Promise<void> {
   }
 }
 
-async function startClient(
-  context: vscode.ExtensionContext,
-  reportErrors: boolean,
-): Promise<void> {
-  try {
-    const configuration = vscode.workspace.getConfiguration("djangoLsp");
-    const resolution = await resolveServer({
-      bundledRoot: context.asAbsolutePath("server"),
-      configuredPath: configuration.get<string>("server.path"),
-    });
-    outputChannel?.appendLine(
-      `Starting ${resolution.command} (${sourceLabel(resolution.source)})`,
-    );
+function projectFolder(
+  root: string,
+  workspaceFolder: vscode.WorkspaceFolder,
+): vscode.WorkspaceFolder {
+  if (root === workspaceFolder.uri.fsPath) {
+    return workspaceFolder;
+  }
+  return {
+    index: workspaceFolder.index,
+    name: `${workspaceFolder.name}: ${path.basename(root)}`,
+    uri: vscode.Uri.file(root),
+  };
+}
 
-    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-    const serverOptions: ServerOptions = {
-      command: resolution.command,
-      args: [],
-      options: {
-        cwd: workspaceFolder?.uri.fsPath,
-        env: process.env,
+function clientKey(root: string): string {
+  const resolved = path.resolve(root);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+async function startClientForDocument(
+  context: vscode.ExtensionContext,
+  document: vscode.TextDocument,
+): Promise<void> {
+  if (document.languageId !== "python" || document.uri.scheme !== "file") {
+    return;
+  }
+  const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
+  if (!workspaceFolder) {
+    return;
+  }
+
+  const configuration = vscode.workspace.getConfiguration(
+    "djangoLsp",
+    document.uri,
+  );
+  const root = await resolveWorkspaceRoot({
+    configuredRoot: configuration.get<string>("workspaceRoot"),
+    documentPath: document.uri.fsPath,
+    workspaceFolderPath: workspaceFolder.uri.fsPath,
+  });
+  const key = clientKey(root);
+  if (clients.has(key)) {
+    return;
+  }
+
+  const resolution = await resolveServer({
+    bundledRoot: context.asAbsolutePath("server"),
+    configuredPath: configuration.get<string>("server.path"),
+  });
+  outputChannel?.appendLine(
+    `Starting ${resolution.command} for ${root} (${sourceLabel(resolution.source)})`,
+  );
+
+  const workspace = projectFolder(root, workspaceFolder);
+  const serverOptions: ServerOptions = {
+    command: resolution.command,
+    args: [],
+    options: {
+      cwd: root,
+      env: process.env,
+    },
+  };
+  const clientOptions: LanguageClientOptions = {
+    documentSelector: [
+      {
+        language: "python",
+        scheme: "file",
+        pattern: { baseUri: workspace.uri.toString(), pattern: "**/*.py" },
       },
-    };
-    const clientOptions: LanguageClientOptions = {
-      documentSelector: [{ language: "python", scheme: "file" }],
-      outputChannel,
-      workspaceFolder,
-    };
+    ],
+    outputChannel,
+    workspaceFolder: workspace,
+  };
 
-    client = new LanguageClient(
-      CLIENT_ID,
-      CLIENT_NAME,
-      serverOptions,
-      clientOptions,
-    );
-    await client.start();
+  const nextClient = new LanguageClient(
+    CLIENT_ID,
+    `${CLIENT_NAME} (${path.basename(root)})`,
+    serverOptions,
+    clientOptions,
+  );
+  clients.set(key, nextClient);
+  try {
+    await nextClient.start();
   } catch (error) {
-    client = undefined;
-    if (reportErrors) {
-      await showStartupError(error);
-    } else {
-      const message = error instanceof Error ? error.message : String(error);
-      outputChannel?.appendLine(`Failed to restart django-lsp: ${message}`);
-      throw error;
-    }
+    clients.delete(key);
+    throw error;
   }
 }
 
-async function stopClient(): Promise<void> {
-  const activeClient = client;
-  client = undefined;
-  if (activeClient) {
-    await activeClient.stop();
-  }
-}
-
-function queueRestart(
+async function startClientsForOpenDocuments(
   context: vscode.ExtensionContext,
-  reportErrors: boolean,
 ): Promise<void> {
+  for (const document of vscode.workspace.textDocuments) {
+    await startClientForDocument(context, document);
+  }
+}
+
+async function stopClients(): Promise<void> {
+  const activeClients = [...clients.values()];
+  clients.clear();
+  await Promise.all(activeClients.map((activeClient) => activeClient.stop()));
+}
+
+async function restartClients(context: vscode.ExtensionContext): Promise<void> {
+  await stopClients();
+  await startClientsForOpenDocuments(context);
+}
+
+function queueOperation(operation: () => Promise<void>): Promise<void> {
   lifecycle = lifecycle
     .catch(() => undefined)
-    .then(async () => {
-      await stopClient();
-      await startClient(context, reportErrors);
-    });
+    .then(operation);
   return lifecycle;
 }
 
@@ -121,7 +169,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(
     vscode.commands.registerCommand("djangoLsp.restartServer", async () => {
       try {
-        await queueRestart(context, false);
+        await queueOperation(() => restartClients(context));
         await vscode.window.showInformationMessage("django-lsp restarted.");
       } catch (error) {
         await showStartupError(error);
@@ -130,16 +178,36 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((event) => {
-      if (event.affectsConfiguration("djangoLsp.server.path")) {
-        void queueRestart(context, true);
+      if (
+        event.affectsConfiguration("djangoLsp.server.path") ||
+        event.affectsConfiguration("djangoLsp.workspaceRoot")
+      ) {
+        void queueOperation(() => restartClients(context)).catch(showStartupError);
       }
     }),
   );
+  context.subscriptions.push(
+    vscode.workspace.onDidOpenTextDocument((document) => {
+      void queueOperation(() => startClientForDocument(context, document)).catch(
+        showStartupError,
+      );
+    }),
+  );
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      void queueOperation(() => restartClients(context)).catch(showStartupError);
+    }),
+  );
 
-  await startClient(context, true);
+  try {
+    await queueOperation(() => startClientsForOpenDocuments(context));
+  } catch (error) {
+    await showStartupError(error);
+  }
 }
 
 export async function deactivate(): Promise<void> {
-  await stopClient();
+  await lifecycle.catch(() => undefined);
+  await stopClients();
   outputChannel = undefined;
 }

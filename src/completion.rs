@@ -603,6 +603,40 @@ Blog.objects.filter(ti)
     }
 
     #[test]
+    fn completes_models_reexported_by_packages() {
+        let (dir, index) = fixture_index(&[
+            (
+                "conferences/models/conference.py",
+                r#"
+from django.db import models
+
+class Conference(models.Model):
+    code = models.CharField(max_length=100)
+"#,
+            ),
+            (
+                "conferences/models/__init__.py",
+                "from .conference import Conference\n",
+            ),
+            (
+                "api/mutations.py",
+                r#"
+from conferences.models import Conference
+
+Conference.objects.filter(co)
+"#,
+            ),
+        ]);
+
+        let path = dir.path().join("api/mutations.py");
+        let source = fs::read_to_string(&path).unwrap();
+        let cursor = source.find("co)").unwrap() + 2;
+        let items = complete(&index, &path, &source, cursor);
+
+        assert!(labels(items).contains(&"code".to_string()));
+    }
+
+    #[test]
     fn completes_relation_fields() {
         let (dir, index) = fixture_index(&[
             (

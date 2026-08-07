@@ -68,6 +68,11 @@ The universal package uses `djangoLsp.server.path` when configured, then looks f
 Use **django-lsp: Restart Django ORM Language Server** after changing the executable or project
 configuration.
 
+In a monorepo or multi-root workspace, the extension starts a client per detected Django project.
+It searches upward from each opened Python file for `manage.py`, then `pyproject.toml`, without
+leaving the containing workspace folder. Set `djangoLsp.workspaceRoot` to a relative or absolute
+path when explicit control is needed.
+
 ### Zed
 
 The first-party [Zed extension](../extensions/zed-extension) attaches `django-lsp` to Python files
