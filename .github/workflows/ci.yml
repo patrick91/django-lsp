@@ -48,3 +48,19 @@ jobs:
           python manage.py test
       - name: Run LSP protocol tests
         run: cargo test --test lsp_protocol
+
+  zed-extension:
+    name: Zed extension
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-wasip1
+      - name: Check formatting
+        run: cargo fmt --manifest-path extensions/zed-extension/Cargo.toml -- --check
+      - name: Run Clippy
+        run: cargo clippy --locked --target wasm32-wasip1 --manifest-path extensions/zed-extension/Cargo.toml -- -D warnings
+      - name: Check extension
+        run: cargo check --locked --target wasm32-wasip1 --manifest-path extensions/zed-extension/Cargo.toml
