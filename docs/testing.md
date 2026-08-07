@@ -29,6 +29,22 @@ Run only this layer with:
 cargo test --test lsp_protocol
 ```
 
+### Real-project responsiveness benchmark
+
+The protocol suite also contains an ignored benchmark for measuring initialization and the request
+barrier immediately after document open and change notifications against a real Django workspace.
+Point it at the directory containing `manage.py`:
+
+```console
+DJANGO_LSP_BENCHMARK_ROOT=/path/to/django/backend \
+  cargo test --test lsp_protocol benchmarks_real_workspace_responsiveness \
+  -- --ignored --nocapture
+```
+
+Set `DJANGO_LSP_BENCHMARK_DOCUMENT` when the representative document is somewhere other than
+`$DJANGO_LSP_BENCHMARK_ROOT/manage.py`. Run the benchmark several times so the first cold filesystem
+scan remains distinguishable from warm runs.
+
 ## Executable completion examples
 
 The human-facing [completion examples](completions.md) contain hidden scenario directives next to

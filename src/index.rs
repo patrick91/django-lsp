@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
@@ -145,10 +146,11 @@ pub struct ModuleAnalysis {
     pub body: Vec<Stmt>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct WorkspaceIndex {
     root: PathBuf,
     config: DjangoLspConfig,
+    analyses: HashMap<PathBuf, Arc<ModuleAnalysis>>,
     pub modules: HashMap<PathBuf, ModuleInfo>,
     pub models: HashMap<ModelId, ModelInfo>,
     models_by_class_name: HashMap<String, Vec<ModelId>>,
@@ -209,11 +211,15 @@ impl PathMatcher {
     }
 
     fn matches(&self, path: &Path) -> bool {
-        if path.extension().and_then(|ext| ext.to_str()) != Some("py") {
+        if !path.starts_with(&self.root)
+            || path.extension().and_then(|ext| ext.to_str()) != Some("py")
+        {
             return false;
         }
 
-        let relative_path = path.strip_prefix(&self.root).unwrap_or(path);
+        let relative_path = path
+            .strip_prefix(&self.root)
+            .expect("workspace path was checked above");
         if self.exclude.is_match(relative_path) {
             return false;
         }
@@ -260,10 +266,7 @@ impl WorkspaceIndex {
         builder.git_exclude(true);
         builder.parents(true);
 
-        let mut analyses = Vec::new();
-        let mut modules = HashMap::new();
-        let mut raw_classes = Vec::new();
-        let mut settings = HashMap::new();
+        let mut analyses = HashMap::new();
 
         for entry in builder.build() {
             let Ok(entry) = entry else {
@@ -287,12 +290,73 @@ impl WorkspaceIndex {
                 }
             };
 
-            let analysis = analyze_source(&root, path, &source);
-            if is_settings_module(&analysis.module_name, config.settings_module.as_deref()) {
+            analyses.insert(
+                path.to_path_buf(),
+                Arc::new(analyze_source(&root, path, &source)),
+            );
+        }
+
+        let mut index = Self {
+            root,
+            config,
+            analyses,
+            modules: HashMap::new(),
+            models: HashMap::new(),
+            models_by_class_name: HashMap::new(),
+            settings: HashMap::new(),
+        };
+        index.rebuild_derived();
+        Ok(index)
+    }
+
+    pub fn refresh_paths(&mut self, paths: &[PathBuf], documents: &DocumentStore) -> Result<usize> {
+        let matcher = PathMatcher::new(&self.root, &self.config)?;
+        let mut refreshed = 0;
+
+        for path in paths {
+            if !matcher.matches(path) {
+                refreshed += usize::from(self.analyses.remove(path).is_some());
+                continue;
+            }
+
+            let source = documents
+                .get(path)
+                .map(|snapshot| snapshot.text.clone())
+                .or_else(|| fs::read_to_string(path).ok());
+
+            if let Some(source) = source {
+                self.analyses.insert(
+                    path.clone(),
+                    Arc::new(analyze_source(&self.root, path, &source)),
+                );
+                refreshed += 1;
+            } else {
+                refreshed += usize::from(self.analyses.remove(path).is_some());
+            }
+        }
+
+        if refreshed > 0 {
+            self.rebuild_derived();
+        }
+
+        Ok(refreshed)
+    }
+
+    fn rebuild_derived(&mut self) {
+        let mut modules = HashMap::new();
+        let mut raw_classes = Vec::new();
+        let mut settings = HashMap::new();
+        let mut analyses = self.analyses.values().collect::<Vec<_>>();
+        analyses.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+
+        for analysis in &analyses {
+            if is_settings_module(
+                &analysis.module_name,
+                self.config.settings_module.as_deref(),
+            ) {
                 settings.extend(extract_settings_assignments(&analysis.body));
             }
-            raw_classes.extend(extract_raw_classes(&analysis));
-            analyses.push(analysis);
+            raw_classes.extend(extract_raw_classes(analysis));
         }
 
         let mut model_ids = HashSet::new();
@@ -422,29 +486,26 @@ impl WorkspaceIndex {
             modules.insert(
                 analysis.path.clone(),
                 ModuleInfo {
-                    path: analysis.path,
-                    module_name: analysis.module_name,
+                    path: analysis.path.clone(),
+                    module_name: analysis.module_name.clone(),
                     is_package: analysis.is_package,
-                    imports: analysis.imports,
+                    imports: analysis.imports.clone(),
                     model_names,
                 },
             );
         }
 
-        Ok(Self {
-            root,
-            config,
-            modules,
-            models,
-            models_by_class_name,
-            settings,
-        })
+        self.modules = modules;
+        self.models = models;
+        self.models_by_class_name = models_by_class_name;
+        self.settings = settings;
     }
 
     pub fn empty(root: PathBuf, config: DjangoLspConfig) -> Self {
         Self {
             root,
             config,
+            analyses: HashMap::new(),
             modules: HashMap::new(),
             models: HashMap::new(),
             models_by_class_name: HashMap::new(),
@@ -458,6 +519,10 @@ impl WorkspaceIndex {
 
     pub fn config(&self) -> &DjangoLspConfig {
         &self.config
+    }
+
+    pub fn analyzed_file_count(&self) -> usize {
+        self.analyses.len()
     }
 
     pub fn setting(&self, name: &str) -> Option<&str> {
@@ -1335,6 +1400,7 @@ fn collect_scope_from_statement(
 mod tests {
     use std::fs;
     use std::path::Path;
+    use std::sync::Arc;
 
     use tempfile::tempdir;
 
@@ -1419,6 +1485,70 @@ from .models import Blog as Post
                 .unwrap()
                 .as_str(),
             "blog.models.Blog"
+        );
+    }
+
+    #[test]
+    fn refreshes_only_changed_file_analysis_and_restores_disk_contents() {
+        let dir = tempdir().unwrap();
+        let app_dir = dir.path().join("blog");
+        let models_path = app_dir.join("models.py");
+        let views_path = app_dir.join("views.py");
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::write(app_dir.join("__init__.py"), "").unwrap();
+        fs::write(
+            &models_path,
+            "from django.db import models\nclass Blog(models.Model):\n    title = models.CharField()\n",
+        )
+        .unwrap();
+        fs::write(&views_path, "from .models import Blog\n").unwrap();
+
+        let mut index = build_index(dir.path());
+        let models_before = Arc::clone(index.analyses.get(&models_path).unwrap());
+        let views_before = Arc::clone(index.analyses.get(&views_path).unwrap());
+        let mut documents = DocumentStore::default();
+        documents.open(
+            models_path.clone(),
+            1,
+            "from django.db import models\nclass Blog(models.Model):\n    title = models.CharField()\n    summary = models.TextField()\n"
+                .to_string(),
+        );
+
+        assert_eq!(
+            index
+                .refresh_paths(std::slice::from_ref(&models_path), &documents)
+                .unwrap(),
+            1
+        );
+        assert!(!Arc::ptr_eq(
+            &models_before,
+            index.analyses.get(&models_path).unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &views_before,
+            index.analyses.get(&views_path).unwrap()
+        ));
+        assert!(
+            index
+                .model(&ModelId::new("blog.models.Blog"))
+                .unwrap()
+                .field("summary")
+                .is_some()
+        );
+
+        documents.close(&models_path);
+        assert_eq!(
+            index
+                .refresh_paths(std::slice::from_ref(&models_path), &documents)
+                .unwrap(),
+            1
+        );
+        assert!(
+            index
+                .model(&ModelId::new("blog.models.Blog"))
+                .unwrap()
+                .field("summary")
+                .is_none()
         );
     }
 
