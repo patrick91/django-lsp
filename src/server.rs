@@ -1,7 +1,11 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinHandle;
+use tokio::time::sleep;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
     CompletionOptions, CompletionResponse, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
@@ -9,13 +13,15 @@ use tower_lsp_server::ls_types::{
     ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
 };
 use tower_lsp_server::{Client, LanguageServer};
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 use crate::completion::complete_lsp_items;
 use crate::config::DjangoLspConfig;
 use crate::document_store::DocumentStore;
 use crate::error::DjangoLspError;
 use crate::index::WorkspaceIndex;
+
+const INDEX_REFRESH_DEBOUNCE: Duration = Duration::from_millis(150);
 
 #[derive(Debug)]
 pub struct Backend {
@@ -26,6 +32,14 @@ pub struct Backend {
 #[derive(Debug, Default)]
 pub struct ServerState {
     inner: RwLock<ServerSnapshot>,
+    refresh: Mutex<RefreshQueue>,
+}
+
+#[derive(Debug, Default)]
+struct RefreshQueue {
+    generation: u64,
+    pending_paths: HashSet<PathBuf>,
+    task: Option<JoinHandle<()>>,
 }
 
 #[derive(Debug, Default)]
@@ -41,35 +55,95 @@ impl Backend {
         Self { client, state }
     }
 
-    async fn rebuild_index(&self) {
-        let (workspace_root, config, documents) = {
-            let snapshot = self.state.inner.read().await;
-            (
-                snapshot.workspace_root.clone(),
-                snapshot.config.clone(),
-                snapshot.documents.clone(),
-            )
-        };
+    async fn update_document_and_schedule<F>(&self, path: PathBuf, update: F)
+    where
+        F: FnOnce(&mut DocumentStore, &Path) + Send,
+    {
+        let state = Arc::downgrade(&self.state);
+        let client = self.client.clone();
+        let mut refresh = self.state.refresh.lock().await;
+        refresh.generation += 1;
+        let generation = refresh.generation;
+        refresh.pending_paths.insert(path.clone());
 
-        let Some(workspace_root) = workspace_root else {
-            return;
-        };
+        if let Some(task) = refresh.task.take() {
+            task.abort();
+        }
 
-        match WorkspaceIndex::build(&workspace_root, config.clone(), &documents) {
-            Ok(index) => {
-                let mut snapshot = self.state.inner.write().await;
+        {
+            let mut snapshot = self.state.inner.write().await;
+            update(&mut snapshot.documents, &path);
+        }
+
+        refresh.task = Some(tokio::spawn(async move {
+            sleep(INDEX_REFRESH_DEBOUNCE).await;
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+
+            let paths = {
+                let refresh = state.refresh.lock().await;
+                if refresh.generation != generation {
+                    return;
+                }
+                refresh.pending_paths.iter().cloned().collect::<Vec<_>>()
+            };
+            let (mut index, documents) = {
+                let snapshot = state.inner.read().await;
+                (snapshot.index.clone(), snapshot.documents.clone())
+            };
+            let started = Instant::now();
+            let result = tokio::task::spawn_blocking(move || {
+                let refreshed_files = index.refresh_paths(&paths, &documents)?;
+                Ok::<_, DjangoLspError>((index, paths, refreshed_files))
+            })
+            .await;
+
+            let (index, paths, refreshed_files) = match result {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => {
+                    warn!("index refresh failed: {error}");
+                    client
+                        .log_message(
+                            MessageType::ERROR,
+                            format!("django-lsp failed to refresh index: {error}"),
+                        )
+                        .await;
+                    return;
+                }
+                Err(error) => {
+                    warn!("index refresh task failed: {error}");
+                    client
+                        .log_message(
+                            MessageType::ERROR,
+                            format!("django-lsp index refresh task failed: {error}"),
+                        )
+                        .await;
+                    return;
+                }
+            };
+
+            let elapsed = started.elapsed();
+            let mut refresh = state.refresh.lock().await;
+            if refresh.generation != generation {
+                debug!(generation, "discarded stale workspace index refresh");
+                return;
+            }
+
+            {
+                let mut snapshot = state.inner.write().await;
                 snapshot.index = index;
             }
-            Err(error) => {
-                warn!("index rebuild failed: {error}");
-                self.client
-                    .log_message(
-                        MessageType::ERROR,
-                        format!("django-lsp failed to refresh index: {error}"),
-                    )
-                    .await;
+            for path in &paths {
+                refresh.pending_paths.remove(path);
             }
-        }
+            debug!(
+                generation,
+                refreshed_files,
+                elapsed_ms = elapsed.as_secs_f64() * 1_000.0,
+                "workspace index refreshed"
+            );
+        }));
     }
 
     #[allow(deprecated)]
@@ -106,18 +180,32 @@ impl LanguageServer for Backend {
         } else {
             DjangoLspConfig::default()
         };
-        let index = workspace_root
-            .as_ref()
-            .and_then(|workspace_root| {
-                WorkspaceIndex::build(workspace_root, config.clone(), &DocumentStore::default())
-                    .ok()
+        let started = Instant::now();
+        let index = if let Some(root) = workspace_root.clone() {
+            let build_config = config.clone();
+            match tokio::task::spawn_blocking(move || {
+                WorkspaceIndex::build(&root, build_config, &DocumentStore::default())
             })
-            .unwrap_or_else(|| {
-                WorkspaceIndex::empty(
-                    workspace_root.clone().unwrap_or_else(|| PathBuf::from(".")),
-                    config.clone(),
-                )
-            });
+            .await
+            {
+                Ok(Ok(index)) => index,
+                Ok(Err(error)) => {
+                    warn!("initial index build failed: {error}");
+                    WorkspaceIndex::empty(workspace_root.clone().unwrap(), config.clone())
+                }
+                Err(error) => {
+                    warn!("initial index build task failed: {error}");
+                    WorkspaceIndex::empty(workspace_root.clone().unwrap(), config.clone())
+                }
+            }
+        } else {
+            WorkspaceIndex::empty(PathBuf::from("."), config.clone())
+        };
+        info!(
+            analyzed_files = index.analyzed_file_count(),
+            elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
+            "workspace index initialized"
+        );
 
         let mut snapshot = self.state.inner.write().await;
         snapshot.workspace_root = workspace_root;
@@ -153,17 +241,12 @@ impl LanguageServer for Backend {
         let Ok(path) = Self::path_from_uri(&params.text_document.uri) else {
             return;
         };
-
-        {
-            let mut snapshot = self.state.inner.write().await;
-            snapshot.documents.open(
-                path,
-                params.text_document.version,
-                params.text_document.text,
-            );
-        }
-
-        self.rebuild_index().await;
+        let version = params.text_document.version;
+        let text = params.text_document.text;
+        self.update_document_and_schedule(path, move |documents, path| {
+            documents.open(path.to_path_buf(), version, text);
+        })
+        .await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -174,14 +257,11 @@ impl LanguageServer for Backend {
             return;
         };
 
-        {
-            let mut snapshot = self.state.inner.write().await;
-            snapshot
-                .documents
-                .update(path, params.text_document.version, change.text);
-        }
-
-        self.rebuild_index().await;
+        let version = params.text_document.version;
+        self.update_document_and_schedule(path, move |documents, path| {
+            documents.update(path.to_path_buf(), version, change.text);
+        })
+        .await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -189,12 +269,10 @@ impl LanguageServer for Backend {
             return;
         };
 
-        {
-            let mut snapshot = self.state.inner.write().await;
-            snapshot.documents.close(&path);
-        }
-
-        self.rebuild_index().await;
+        self.update_document_and_schedule(path, |documents, path| {
+            documents.close(path);
+        })
+        .await;
     }
 
     async fn completion(
