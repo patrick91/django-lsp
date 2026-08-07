@@ -50,6 +50,24 @@ Configure a Python language-server entry with:
 The server writes diagnostics and lifecycle logging to standard error so standard output remains a
 valid LSP stream.
 
+### Visual Studio Code
+
+The first-party [Visual Studio Code extension](../extensions/vscode-extension) attaches
+`django-lsp` to Python files without replacing Pylance, Pyright, Ruff, or another general Python
+language server. Build and install its universal development package from the repository root:
+
+```console
+cd extensions/vscode-extension
+npm ci
+npm run package:universal
+code --install-extension dist/django-lsp-universal.vsix
+```
+
+The universal package uses `djangoLsp.server.path` when configured, then looks for `django-lsp` on
+`PATH`. Platform-specific release packages additionally contain the matching server executable.
+Use **django-lsp: Restart Django ORM Language Server** after changing the executable or project
+configuration.
+
 ### Zed
 
 The first-party [Zed extension](../extensions/zed-extension) attaches `django-lsp` to Python files

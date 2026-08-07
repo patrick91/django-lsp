@@ -67,6 +67,29 @@ cargo run --bin render-docs -- --check
 
 `tests/markdown_docs.rs` runs the check as part of `cargo test --all-targets`.
 
+## Editor extensions
+
+Validate the Zed extension from its directory:
+
+```console
+cd extensions/zed-extension
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
+```
+
+Validate and package the universal Visual Studio Code development extension from its directory:
+
+```console
+cd extensions/vscode-extension
+npm ci
+npm run check
+npm run package:universal
+```
+
+The universal VSIX intentionally contains no server executable. It tests the same client code used
+by release packages while resolving `django-lsp` from the configured path or `PATH`.
+
 ## Django compatibility matrix
 
 CI validates the fixture and protocol tests against the latest compatible patch releases in the
@@ -80,7 +103,7 @@ uv run --no-project --python 3.12 --with 'Django~=6.1.0' python manage.py test
 The fixture's own Django tests verify that its model and relation metadata remains valid. The Rust
 protocol tests then verify that those same patterns produce the expected editor completions.
 
-## Distribution wheels
+## Distribution packages
 
 The release workflow builds the same platform wheels used for tagged releases on every pull request:
 
@@ -91,3 +114,9 @@ The release workflow builds the same platform wheels used for tagged releases on
 Each job installs its wheel with `uv tool install` on a native runner and executes
 `django-lsp --version`. Tagged `v*` builds publish those already-tested artifacts to GitHub Releases
 and PyPI; pull requests never receive publishing permissions.
+
+The release workflow also packages five platform-specific Visual Studio Code extensions from those
+tested executables: Linux x86-64 and ARM64, macOS Intel and Apple Silicon, and Windows x86-64. Every
+VSIX contains the server for exactly one VS Code target. Pull requests retain the packages as CI
+artifacts; tagged builds add them to the GitHub Release. The VS Code extension and Rust server
+versions stay in sync, and the tag release guard verifies both before publishing.

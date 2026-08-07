@@ -1,0 +1,93 @@
+{
+  "name": "django-lsp",
+  "displayName": "Django ORM Language Server",
+  "description": "Django ORM query completions for Python",
+  "version": "0.1.2",
+  "publisher": "patrick91",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/patrick91/django-lsp.git",
+    "directory": "extensions/vscode-extension"
+  },
+  "engines": {
+    "vscode": "^1.91.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "django",
+    "orm",
+    "python",
+    "language-server",
+    "autocomplete"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "django-lsp reads Python files in the workspace and launches a native language server."
+    },
+    "virtualWorkspaces": {
+      "supported": false
+    }
+  },
+  "activationEvents": [
+    "onLanguage:python"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "djangoLsp.restartServer",
+        "title": "Restart Django ORM Language Server",
+        "category": "django-lsp"
+      }
+    ],
+    "configuration": {
+      "title": "django-lsp",
+      "properties": {
+        "djangoLsp.server.path": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "markdownDescription": "Absolute path to the `django-lsp` executable. Leave empty to use `django-lsp` from `PATH`, then the server bundled in a platform-specific VSIX."
+        },
+        "djangoLsp.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "scope": "window",
+          "description": "Trace communication between VS Code and django-lsp."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "bundle": "node esbuild.mjs",
+    "check": "npm run test && npm run bundle",
+    "package:platform": "node scripts/package-platform.mjs",
+    "package:universal": "npm run test && vsce package --no-dependencies --out dist/django-lsp-universal.vsix",
+    "test": "tsc -p tsconfig.json && node --test out/test/server-path.test.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "vscode:prepublish": "npm run bundle"
+  },
+  "dependencies": {
+    "vscode-languageclient": "10.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "1.91.0",
+    "@vscode/vsce": "3.9.2",
+    "esbuild": "0.28.1",
+    "typescript": "5.9.3"
+  }
+}

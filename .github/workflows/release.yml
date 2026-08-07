@@ -33,20 +33,20 @@ jobs:
             manylinux: "off"
 
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
       - uses: dtolnay/rust-toolchain@1.95.0
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
-      - name: Check tag matches package version
+      - name: Check tag matches package versions
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: |
-          python -c 'import os, tomllib; version = tomllib.load(open("Cargo.toml", "rb"))["package"]["version"]; tag = os.environ["GITHUB_REF_NAME"]; assert tag == f"v{version}", f"tag {tag} does not match version {version}"'
+          python -c 'import json, os, tomllib; server = tomllib.load(open("Cargo.toml", "rb"))["package"]["version"]; extension = json.load(open("extensions/vscode-extension/package.json"))["version"]; tag = os.environ["GITHUB_REF_NAME"]; assert tag == f"v{server}" == f"v{extension}", f"tag {tag}, server v{server}, and extension v{extension} must match"'
       - name: Build wheel
-        uses: PyO3/maturin-action@86b9d133d34bc1b40018696f782949dac11bd380 # v1.49.4
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           maturin-version: v1.11.5
           target: ${{ matrix.platform.target }}
@@ -64,37 +64,80 @@ jobs:
         run: |
           python -c 'import os, pathlib, shutil, subprocess; suffix = ".exe" if os.name == "nt" else ""; target = os.environ["TARGET"]; source = pathlib.Path(subprocess.check_output(["uv", "tool", "dir", "--bin"], text=True).strip()) / f"django-lsp{suffix}"; destination = pathlib.Path("dist") / f"django-lsp-{target}{suffix}"; shutil.copy2(source, destination); subprocess.run([destination.resolve(), "--version"], check=True)'
       - name: Upload wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.platform.target }}
           path: dist/*.whl
           if-no-files-found: error
       - name: Upload extension binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: binaries-${{ matrix.platform.target }}
           path: dist/django-lsp-${{ matrix.platform.target }}*
           if-no-files-found: error
 
+  vscode-extension:
+    name: VS Code packages
+    needs: wheels
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: extensions/vscode-extension/package-lock.json
+      - name: Download extension binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: binaries-*
+          path: vscode-binaries
+          merge-multiple: true
+      - name: Install dependencies
+        working-directory: extensions/vscode-extension
+        run: npm ci
+      - name: Run extension tests
+        working-directory: extensions/vscode-extension
+        run: npm test
+      - name: Package platform-specific VSIX files
+        working-directory: extensions/vscode-extension
+        run: |
+          npm run package:platform -- darwin-arm64 ../../vscode-binaries/django-lsp-aarch64-apple-darwin dist
+          npm run package:platform -- darwin-x64 ../../vscode-binaries/django-lsp-x86_64-apple-darwin dist
+          npm run package:platform -- linux-arm64 ../../vscode-binaries/django-lsp-aarch64-unknown-linux-gnu dist
+          npm run package:platform -- linux-x64 ../../vscode-binaries/django-lsp-x86_64-unknown-linux-gnu dist
+          npm run package:platform -- win32-x64 ../../vscode-binaries/django-lsp-x86_64-pc-windows-msvc.exe dist
+      - name: Upload platform-specific VSIX files
+        uses: actions/upload-artifact@v7
+        with:
+          name: vscode-extensions
+          path: extensions/vscode-extension/dist/*.vsix
+          if-no-files-found: error
+
   github-release:
     name: Publish GitHub release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: wheels
+    needs: [wheels, vscode-extension]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           pattern: wheels-*
           path: dist
           merge-multiple: true
       - name: Download extension binaries
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           pattern: binaries-*
           path: dist
           merge-multiple: true
+      - name: Download VS Code extensions
+        uses: actions/download-artifact@v8
+        with:
+          name: vscode-extensions
+          path: dist
       - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -115,7 +158,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           pattern: wheels-*
           path: dist

@@ -28,6 +28,13 @@ django-lsp --version
 Point an editor's LSP client at the `django-lsp` command, with no arguments. The server uses standard
 input and output for LSP communication.
 
+### Visual Studio Code
+
+The repository includes a [Visual Studio Code extension](extensions/vscode-extension) that runs
+`django-lsp` alongside Pylance, Pyright, Ruff, or another general Python language server. It uses a
+configured executable, one already installed on `PATH`, or the executable bundled into a
+platform-specific VSIX. See the extension README for development installation and packaging.
+
 ### Zed
 
 The repository includes a [Zed extension](extensions/zed-extension) that registers `django-lsp`
