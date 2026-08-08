@@ -105,12 +105,36 @@ impl FieldKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationDirection {
+    Forward,
+    Reverse,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldInfo {
     pub name: String,
     pub kind: FieldKind,
     pub related_model: Option<ModelId>,
+    pub relation_direction: Option<RelationDirection>,
+    pub relation_accessor: Option<String>,
     pub supported_lookups: &'static [&'static str],
+}
+
+impl FieldInfo {
+    pub fn supports_select_related(&self) -> bool {
+        self.related_model.is_some()
+            && matches!(
+                (self.relation_direction, self.kind),
+                (Some(RelationDirection::Forward), FieldKind::ForeignKey)
+                    | (Some(RelationDirection::Forward), FieldKind::OneToOne)
+                    | (Some(RelationDirection::Reverse), FieldKind::OneToOne)
+            )
+    }
+
+    pub fn supports_prefetch_related(&self) -> bool {
+        self.related_model.is_some() && self.relation_accessor.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +196,7 @@ struct PendingField {
     kind: FieldKind,
     relation_target: Option<PendingRelationTarget>,
     reverse_query_name: Option<String>,
+    reverse_accessor_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -416,6 +441,11 @@ impl WorkspaceIndex {
                             &settings,
                         )
                     }),
+                    relation_direction: field
+                        .kind
+                        .is_relation()
+                        .then_some(RelationDirection::Forward),
+                    relation_accessor: field.kind.is_relation().then(|| field.name.clone()),
                     supported_lookups: GENERIC_LOOKUPS,
                 })
                 .collect();
@@ -437,6 +467,9 @@ impl WorkspaceIndex {
         {
             for field in &class.fields {
                 let Some(reverse_query_name) = field.reverse_query_name.as_ref() else {
+                    continue;
+                };
+                let Some(reverse_accessor_name) = field.reverse_accessor_name.as_ref() else {
                     continue;
                 };
 
@@ -469,6 +502,8 @@ impl WorkspaceIndex {
                     name: reverse_query_name.clone(),
                     kind: field.kind,
                     related_model: Some(class.id.clone()),
+                    relation_direction: Some(RelationDirection::Reverse),
+                    relation_accessor: Some(reverse_accessor_name.clone()),
                     supported_lookups: GENERIC_LOOKUPS,
                 });
             }
@@ -964,11 +999,15 @@ fn extract_field_from_value(
         None
     };
 
+    let (reverse_query_name, reverse_accessor_name) =
+        reverse_relation_names(kind, class_name, &call.arguments.keywords);
+
     Some(PendingField {
         name: target_name.to_string(),
         kind,
         relation_target,
-        reverse_query_name: relation_query_name(kind, class_name, &call.arguments.keywords),
+        reverse_query_name,
+        reverse_accessor_name,
     })
 }
 
@@ -999,13 +1038,13 @@ fn extract_relation_target(
     }
 }
 
-fn relation_query_name(
+fn reverse_relation_names(
     kind: FieldKind,
     class_name: &str,
     keywords: &[ast::Keyword],
-) -> Option<String> {
+) -> (Option<String>, Option<String>) {
     if !kind.is_relation() {
-        return None;
+        return (None, None);
     }
 
     let related_name = keyword_string_value(keywords, "related_name");
@@ -1013,12 +1052,20 @@ fn relation_query_name(
         .as_deref()
         .is_some_and(|name| name.contains('+'))
     {
-        return None;
+        return (None, None);
     }
 
-    keyword_string_value(keywords, "related_query_name")
-        .or(related_name)
-        .or_else(|| Some(class_name.to_lowercase()))
+    let default_query_name = class_name.to_lowercase();
+    let query_name = keyword_string_value(keywords, "related_query_name")
+        .or_else(|| related_name.clone())
+        .unwrap_or_else(|| default_query_name.clone());
+    let accessor_name = related_name.unwrap_or_else(|| match kind {
+        FieldKind::OneToOne => default_query_name,
+        FieldKind::ForeignKey | FieldKind::ManyToMany => format!("{default_query_name}_set"),
+        FieldKind::Scalar => unreachable!("scalar fields do not have reverse relations"),
+    });
+
+    (Some(query_name), Some(accessor_name))
 }
 
 fn keyword_string_value(keywords: &[ast::Keyword], expected_name: &str) -> Option<String> {

@@ -18,3 +18,4 @@ class ModelMetadataTests(SimpleTestCase):
         relation = Blog._meta.get_field("author").remote_field
         self.assertEqual(relation.related_name, "blogs")
         self.assertEqual(relation.related_query_name, "authored_blogs")
+        self.assertEqual(relation.get_accessor_name(), "blogs")

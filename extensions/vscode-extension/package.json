@@ -2,7 +2,7 @@
   "name": "django-lsp",
   "displayName": "Django ORM Language Server",
   "description": "Django ORM query completions for Python",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "publisher": "patrick91",
   "private": true,
   "license": "MIT",
