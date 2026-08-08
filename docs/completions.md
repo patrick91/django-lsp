@@ -185,6 +185,51 @@ Author.objects.filter(
 ```
 <!-- django-lsp-output:end -->
 
+## Related-object loading
+
+String arguments to `select_related()` only offer single-valued relationships. Completion follows
+foreign keys and one-to-one fields across multiple models, while excluding scalar and many-to-many
+fields.
+
+<!-- django-lsp-example file=blog/views.py limit=8
+from .models import Blog
+
+Blog.objects.select_related(
+    "author__te<cursor>"
+)
+-->
+<!-- django-lsp-output:start -->
+```text
+from .models import Blog
+
+Blog.objects.select_related(
+    "author__te"
+               └─ author__team
+)
+```
+<!-- django-lsp-output:end -->
+
+`prefetch_related()` offers every relationship type. Reverse relationships use their Python
+accessor names, which can differ from the query names used by `filter()`.
+
+<!-- django-lsp-example file=blog/views.py limit=8
+from .models import Author
+
+Author.objects.prefetch_related(
+    "blogs__ta<cursor>"
+)
+-->
+<!-- django-lsp-output:start -->
+```text
+from .models import Author
+
+Author.objects.prefetch_related(
+    "blogs__ta"
+              └─ blogs__tags
+)
+```
+<!-- django-lsp-output:end -->
+
 ## `AUTH_USER_MODEL` relations
 
 Relations declared through `settings.AUTH_USER_MODEL` resolve to the configured user model.

@@ -54,7 +54,8 @@ development installation while its extension-gallery submission is in progress.
 ## Current scope
 
 - workspace model indexing
-- completion inside `filter(...)`, `exclude(...)`, and `get(...)`
+- completion inside `filter(...)`, `exclude(...)`, `get(...)`, `select_related(...)`, and
+  `prefetch_related(...)`
 - forward, reverse, and recursive relation traversal
 - `AUTH_USER_MODEL` support
 - models re-exported from package `__init__.py` modules

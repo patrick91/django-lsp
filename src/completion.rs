@@ -11,7 +11,8 @@ use crate::index::{
     infer_model_for_expression,
 };
 
-const QUERY_METHODS: &[&str] = &["filter", "exclude", "get"];
+const QUERY_EXPRESSION_METHODS: &[&str] = &["filter", "exclude", "get"];
+const RELATED_LOADING_METHODS: &[&str] = &["select_related", "prefetch_related"];
 const RELATION_LOOKUPS: &[&str] = &["exact", "in", "isnull"];
 const MAX_COMPLETION_RELATION_DEPTH: usize = 3;
 
@@ -48,10 +49,6 @@ pub fn complete(
         return Vec::new();
     };
 
-    if !QUERY_METHODS.contains(&request.method.as_str()) {
-        return Vec::new();
-    }
-
     let analysis = analyze_source(index.root(), path, source);
     let mut imports = analysis.imports.clone();
     let mut bindings = HashMap::new();
@@ -79,7 +76,13 @@ pub fn complete(
         return Vec::new();
     };
 
-    build_candidates(index, &model_id, &request.token)
+    if QUERY_EXPRESSION_METHODS.contains(&request.method.as_str()) {
+        build_candidates(index, &model_id, &request.token)
+    } else if RELATED_LOADING_METHODS.contains(&request.method.as_str()) {
+        build_related_loading_candidates(index, &model_id, &request.token, &request.method)
+    } else {
+        Vec::new()
+    }
 }
 
 pub fn complete_lsp_items(
@@ -205,6 +208,101 @@ fn build_candidates(
     output.candidates
 }
 
+fn build_related_loading_candidates(
+    index: &WorkspaceIndex,
+    root_model_id: &ModelId,
+    token: &str,
+    method: &str,
+) -> Vec<CompletionCandidate> {
+    let Some(root_model) = index.model(root_model_id) else {
+        return Vec::new();
+    };
+
+    let context = RelatedLoadingContext {
+        candidates: CandidateContext {
+            index,
+            typed_token: token,
+            context_chain: token
+                .rsplit_once("__")
+                .map_or("", |(context_chain, _)| context_chain),
+        },
+        method,
+        requested_depth: path_depth(token),
+    };
+    let mut output = CandidateOutput::default();
+    let mut visited = HashSet::from([root_model.id.clone()]);
+    add_related_loading_candidates(&mut output, &context, root_model, "", 0, &mut visited);
+    output.candidates.sort_by(|left, right| {
+        left.sort_rank
+            .cmp(&right.sort_rank)
+            .then_with(|| left.filter_text.cmp(&right.filter_text))
+    });
+    output.candidates
+}
+
+fn add_related_loading_candidates(
+    output: &mut CandidateOutput,
+    context: &RelatedLoadingContext<'_>,
+    model: &crate::index::ModelInfo,
+    prefix_chain: &str,
+    relation_depth: usize,
+    visited: &mut HashSet<ModelId>,
+) {
+    for field in &model.fields {
+        let supported = match context.method {
+            "select_related" => field.supports_select_related(),
+            "prefetch_related" => field.supports_prefetch_related(),
+            _ => false,
+        };
+        if !supported {
+            continue;
+        }
+
+        let Some(segment) = field.relation_accessor.as_deref() else {
+            continue;
+        };
+        let full_path = join_chain(prefix_chain, segment);
+        if full_path.starts_with(context.candidates.typed_token)
+            && output.seen.insert(full_path.clone())
+        {
+            output.candidates.push(CompletionCandidate {
+                label: full_path.clone(),
+                insert_text: completion_insert_text(&full_path, context.candidates.context_chain),
+                filter_text: full_path.clone(),
+                detail: format!("{} relation on {}", context.method, model.class_name),
+                kind: CompletionItemKind::FIELD,
+                sort_group: 0,
+                sort_rank: path_depth(&full_path) * 1000 + full_path.len(),
+            });
+        }
+
+        if relation_depth >= context.requested_depth
+            || relation_depth >= MAX_COMPLETION_RELATION_DEPTH
+        {
+            continue;
+        }
+
+        let Some(related_model_id) = field.related_model.as_ref() else {
+            continue;
+        };
+        if !visited.insert(related_model_id.clone()) {
+            continue;
+        }
+
+        if let Some(related_model) = context.candidates.index.model(related_model_id) {
+            add_related_loading_candidates(
+                output,
+                context,
+                related_model,
+                &full_path,
+                relation_depth + 1,
+                visited,
+            );
+        }
+        visited.remove(related_model_id);
+    }
+}
+
 #[derive(Default)]
 struct CandidateOutput {
     candidates: Vec<CompletionCandidate>,
@@ -215,6 +313,12 @@ struct CandidateContext<'a> {
     index: &'a WorkspaceIndex,
     typed_token: &'a str,
     context_chain: &'a str,
+}
+
+struct RelatedLoadingContext<'a> {
+    candidates: CandidateContext<'a>,
+    method: &'a str,
+    requested_depth: usize,
 }
 
 fn add_descendant_candidates(
@@ -384,7 +488,14 @@ pub fn extract_completion_request(source: &str, cursor_offset: usize) -> Option<
     let open_paren = find_enclosing_call_open(source, replace_start)?;
     let receiver = extract_receiver(source, open_paren)?;
     let (base_expression, method) = split_receiver(&receiver)?;
-    if !QUERY_METHODS.contains(&method.as_str()) {
+    if !QUERY_EXPRESSION_METHODS.contains(&method.as_str())
+        && !RELATED_LOADING_METHODS.contains(&method.as_str())
+    {
+        return None;
+    }
+    if RELATED_LOADING_METHODS.contains(&method.as_str())
+        && !is_inside_string_literal(source, open_paren + 1, cursor_offset)
+    {
         return None;
     }
 
@@ -395,6 +506,37 @@ pub fn extract_completion_request(source: &str, cursor_offset: usize) -> Option<
         base_expression,
         method,
     })
+}
+
+fn is_inside_string_literal(source: &str, start: usize, end: usize) -> bool {
+    let Some(fragment) = source.get(start..end) else {
+        return false;
+    };
+    let mut quote = None;
+    let mut escaped = false;
+    let mut comment = false;
+
+    for ch in fragment.chars() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+        } else if comment {
+            if ch == '\n' {
+                comment = false;
+            }
+        } else if ch == '#' {
+            comment = true;
+        } else if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        }
+    }
+
+    quote.is_some()
 }
 
 fn scan_identifier_start(source: &str, cursor_offset: usize) -> usize {
@@ -1004,6 +1146,251 @@ def run():
         let cursor = source.find("ti)").unwrap() + 2;
         let items = complete(&index, &dir.path().join("blog/views.py"), &source, cursor);
         assert!(labels(items).contains(&"title".to_string()));
+    }
+
+    #[test]
+    fn completes_single_valued_select_related_paths() {
+        let (dir, index) = fixture_index(&[
+            (
+                "blog/models.py",
+                r#"
+from django.db import models
+
+class Team(models.Model):
+    name = models.CharField(max_length=64)
+
+class Author(models.Model):
+    email = models.EmailField()
+    team = models.ForeignKey(Team, on_delete=models.CASCADE)
+
+class Tag(models.Model):
+    name = models.CharField(max_length=64)
+
+class Blog(models.Model):
+    author = models.ForeignKey(Author, on_delete=models.CASCADE)
+    tags = models.ManyToManyField(Tag)
+"#,
+            ),
+            (
+                "blog/views.py",
+                r#"
+from .models import Blog
+
+Blog.objects.select_related("author__te")
+"#,
+            ),
+        ]);
+
+        let path = dir.path().join("blog/views.py");
+        let source = fs::read_to_string(&path).unwrap();
+        let cursor = source.find("__te\"").unwrap() + "__te".len();
+        let items = complete_lsp_items(&index, &path, &source, cursor);
+        let team = items
+            .iter()
+            .find(|item| item.label == "author__team")
+            .unwrap();
+        let edit = match team.text_edit.as_ref().unwrap() {
+            CompletionTextEdit::Edit(edit) => edit,
+            CompletionTextEdit::InsertAndReplace(_) => panic!("unexpected insert-and-replace edit"),
+        };
+
+        assert_eq!(edit.new_text, "team");
+        assert!(!items.iter().any(|item| item.label == "author__email"));
+        assert!(!items.iter().any(|item| item.label.starts_with("tags")));
+    }
+
+    #[test]
+    fn select_related_supports_reverse_one_to_one_only() {
+        let (dir, index) = fixture_index(&[
+            (
+                "blog/models.py",
+                r#"
+from django.db import models
+
+class Author(models.Model):
+    email = models.EmailField()
+
+class Profile(models.Model):
+    author = models.OneToOneField(Author, on_delete=models.CASCADE, related_name="profile")
+
+class Blog(models.Model):
+    author = models.ForeignKey(Author, on_delete=models.CASCADE, related_name="blogs")
+"#,
+            ),
+            (
+                "blog/views.py",
+                r#"
+from .models import Author
+
+Author.objects.select_related("")
+"#,
+            ),
+        ]);
+
+        let path = dir.path().join("blog/views.py");
+        let source = fs::read_to_string(&path).unwrap();
+        let cursor = source.find("\"\"").unwrap() + 1;
+        let labels = labels(complete(&index, &path, &source, cursor));
+
+        assert!(labels.contains(&"profile".to_string()));
+        assert!(!labels.contains(&"blogs".to_string()));
+    }
+
+    #[test]
+    fn prefetch_related_uses_reverse_accessors_and_all_relation_kinds() {
+        let (dir, index) = fixture_index(&[
+            (
+                "blog/models.py",
+                r#"
+from django.db import models
+
+class Author(models.Model):
+    email = models.EmailField()
+
+class Tag(models.Model):
+    name = models.CharField(max_length=64)
+
+class Blog(models.Model):
+    author = models.ForeignKey(
+        Author,
+        on_delete=models.CASCADE,
+        related_name="blogs",
+        related_query_name="authored_blogs",
+    )
+    tags = models.ManyToManyField(Tag)
+"#,
+            ),
+            (
+                "blog/views.py",
+                r#"
+from .models import Author
+
+Author.objects.prefetch_related("blogs__ta")
+"#,
+            ),
+        ]);
+
+        let path = dir.path().join("blog/views.py");
+        let source = fs::read_to_string(&path).unwrap();
+        let cursor = source.find("__ta\"").unwrap() + "__ta".len();
+        let items = complete_lsp_items(&index, &path, &source, cursor);
+        let tags = items
+            .iter()
+            .find(|item| item.label == "blogs__tags")
+            .unwrap();
+        let edit = match tags.text_edit.as_ref().unwrap() {
+            CompletionTextEdit::Edit(edit) => edit,
+            CompletionTextEdit::InsertAndReplace(_) => panic!("unexpected insert-and-replace edit"),
+        };
+
+        assert_eq!(edit.new_text, "tags");
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.label.contains("authored_blogs"))
+        );
+        assert!(!items.iter().any(|item| item.label == "blogs__tags__blogs"));
+    }
+
+    #[test]
+    fn prefetch_related_uses_default_reverse_accessors() {
+        let (dir, index) = fixture_index(&[
+            (
+                "blog/models.py",
+                r#"
+from django.db import models
+
+class Team(models.Model):
+    name = models.CharField(max_length=64)
+
+class Author(models.Model):
+    team = models.ForeignKey(Team, on_delete=models.CASCADE)
+"#,
+            ),
+            (
+                "blog/views.py",
+                r#"
+from .models import Team
+
+Team.objects.prefetch_related('author_s')
+"#,
+            ),
+        ]);
+
+        let path = dir.path().join("blog/views.py");
+        let source = fs::read_to_string(&path).unwrap();
+        let cursor = source.find("author_s'").unwrap() + "author_s".len();
+        let labels = labels(complete(&index, &path, &source, cursor));
+
+        assert!(labels.contains(&"author_set".to_string()));
+        assert!(!labels.contains(&"author".to_string()));
+    }
+
+    #[test]
+    fn related_loading_completion_requires_a_string_literal() {
+        let (dir, index) = fixture_index(&[
+            (
+                "blog/models.py",
+                r#"
+from django.db import models
+
+class Author(models.Model):
+    email = models.EmailField()
+
+class Blog(models.Model):
+    author = models.ForeignKey(Author, on_delete=models.CASCADE)
+"#,
+            ),
+            (
+                "blog/views.py",
+                r#"
+from .models import Blog
+
+Blog.objects.select_related(author)
+"#,
+            ),
+        ]);
+
+        let path = dir.path().join("blog/views.py");
+        let source = fs::read_to_string(&path).unwrap();
+        let cursor = source.find("author)").unwrap() + "author".len();
+
+        assert!(complete(&index, &path, &source, cursor).is_empty());
+    }
+
+    #[test]
+    fn related_loading_completion_ignores_quotes_in_comments() {
+        let (dir, index) = fixture_index(&[
+            (
+                "blog/models.py",
+                r#"
+from django.db import models
+
+class Author(models.Model):
+    email = models.EmailField()
+
+class Blog(models.Model):
+    author = models.ForeignKey(Author, on_delete=models.CASCADE)
+"#,
+            ),
+            (
+                "blog/views.py",
+                r#"
+from .models import Blog
+
+Blog.objects.select_related(
+    # The "primary" author.
+    "au"
+)
+"#,
+            ),
+        ]);
+
+        let path = dir.path().join("blog/views.py");
+        let source = fs::read_to_string(&path).unwrap();
+        let cursor = source.find("au\"").unwrap() + "au".len();
+
+        assert!(labels(complete(&index, &path, &source, cursor)).contains(&"author".to_string()));
     }
 
     #[test]

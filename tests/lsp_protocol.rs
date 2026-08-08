@@ -67,6 +67,10 @@ async fn completes_a_django_project_over_json_rpc() {
     let response = send(&mut service, initialize).await.unwrap();
     assert!(response.is_ok());
     assert!(response.result().unwrap()["capabilities"]["completionProvider"].is_object());
+    assert_eq!(
+        response.result().unwrap()["capabilities"]["completionProvider"]["triggerCharacters"],
+        json!(["_", "\"", "'"])
+    );
 
     let initialized = Request::build("initialized").params(json!({})).finish();
     assert!(send(&mut service, initialized).await.is_none());
@@ -115,6 +119,38 @@ async fn completes_a_django_project_over_json_rpc() {
         .finish();
     let response = send(&mut service, user_completion).await.unwrap();
     assert!(completion_labels(&response).contains(&"installer__timezone"));
+
+    let select_related_completion = Request::build("textDocument/completion")
+        .params(json!({
+            "textDocument": {"uri": views_uri},
+            "position": position_after(&views_source, "\"author__te"),
+        }))
+        .id(4)
+        .finish();
+    let response = send(&mut service, select_related_completion).await.unwrap();
+    let team = response
+        .result()
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["label"] == "author__team")
+        .unwrap();
+    assert_eq!(team["textEdit"]["newText"], "team");
+
+    let prefetch_related_completion = Request::build("textDocument/completion")
+        .params(json!({
+            "textDocument": {"uri": views_uri},
+            "position": position_after(&views_source, "\"bl"),
+        }))
+        .id(5)
+        .finish();
+    let response = send(&mut service, prefetch_related_completion)
+        .await
+        .unwrap();
+    let labels = completion_labels(&response);
+    assert!(labels.contains(&"blogs"));
+    assert!(!labels.contains(&"blogs__tags"));
 
     let models_path = root.join("blog/models.py");
     let models_uri = file_uri(&models_path);
@@ -172,7 +208,7 @@ async fn completes_a_django_project_over_json_rpc() {
             "textDocument": {"uri": views_uri},
             "position": position_after(&changed_views, "desc"),
         }))
-        .id(4)
+        .id(6)
         .finish();
     let response = send(&mut service, unsaved_completion).await.unwrap();
     assert!(completion_labels(&response).contains(&"description"));
@@ -189,7 +225,7 @@ async fn completes_a_django_project_over_json_rpc() {
             "textDocument": {"uri": views_uri},
             "position": position_after(&changed_views, "desc"),
         }))
-        .id(5)
+        .id(7)
         .finish();
     let response = send(&mut service, reverted_completion).await.unwrap();
     assert_eq!(response.result(), Some(&Value::Null));

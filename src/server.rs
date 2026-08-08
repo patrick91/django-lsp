@@ -218,7 +218,11 @@ impl LanguageServer for Backend {
                     TextDocumentSyncKind::FULL,
                 )),
                 completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec!["_".to_string()]),
+                    trigger_characters: Some(vec![
+                        "_".to_string(),
+                        "\"".to_string(),
+                        "'".to_string(),
+                    ]),
                     ..CompletionOptions::default()
                 }),
                 ..ServerCapabilities::default()
