@@ -11,7 +11,6 @@ one-click installation and lifecycle management in each editor.
 Extensions should run `django-lsp` alongside a general Python language server. They are responsible
 only for locating or packaging the executable and connecting it over standard input and output.
 
-Tagged releases publish the five platform-specific VS Code packages through GitHub Actions and
-Visual Studio Marketplace trusted publishing. The Marketplace policy must allow repository owner
-`patrick91`, repository `django-lsp`, and workflow `release.yml`; the workflow does not use a
-long-lived publishing token.
+Tagged releases publish the five platform-specific VS Code packages through GitHub Actions. Add a
+repository Actions secret named `VSCE_PAT` containing an Azure DevOps token scoped to
+`Marketplace: Manage`; the workflow passes it to the stable `vsce` release only while publishing.
