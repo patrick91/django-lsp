@@ -24,10 +24,15 @@ current supported query patterns.
 
 ## Installation
 
-Install **Django ORM Language Server** from the
+In Visual Studio Code, install **Django ORM Language Server** from the
 [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=patrick91.django-lsp).
-Platform-specific packages include the native `django-lsp` server, so no separate Python or Rust
-installation is required on supported macOS, Linux, and Windows systems.
+
+Cursor uses an Open VSX-compatible extension gallery. Until the Open VSX publication is available,
+download the VSIX for your platform from the [latest GitHub release](https://github.com/patrick91/django-lsp/releases/latest),
+then run **Extensions: Install from VSIX...** from Cursor's command palette.
+
+The platform-specific Marketplace and release packages include the native `django-lsp` server, so
+no separate Python or Rust installation is required on supported macOS, Linux, and Windows systems.
 
 Open a Django project containing `manage.py` or `pyproject.toml`, then start typing inside a
 supported ORM query. The extension starts automatically for Python files.
