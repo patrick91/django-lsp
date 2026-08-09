@@ -13,12 +13,12 @@ only for locating or packaging the executable and connecting it over standard in
 
 Tagged releases publish the five platform-specific VS Code packages through GitHub Actions using
 Microsoft Entra workload identity federation. The `vscode-marketplace` GitHub environment needs
-three Actions variables: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and `AZURE_SUBSCRIPTION_ID`.
+two Actions variables: `AZURE_CLIENT_ID` and `AZURE_TENANT_ID`.
 
 The client ID belongs to a user-assigned Azure managed identity with:
 
 - a federated credential for the subject
-  `repo:patrick91/django-lsp:environment:vscode-marketplace` and audience
+  `repo:patrick91@667029/django-lsp@1201471216:environment:vscode-marketplace` and audience
   `api://AzureADTokenExchange`; and
 - Contributor access to the `patrick91` Visual Studio Marketplace publisher.
 
