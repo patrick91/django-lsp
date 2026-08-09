@@ -1,0 +1,36 @@
+{
+  "name": "django-lsp-website",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "bun@1.3.13",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "serve": "uv run fastapi dev app.py",
+    "check": "tsc --noEmit",
+    "build:client": "vite build",
+    "build:ssr": "vite build --ssr",
+    "build": "bun run build:client && bun run build:ssr",
+    "preview": "uv run fastapi run app.py",
+    "deploy": "bun run build && uv run fastapi deploy"
+  },
+  "dependencies": {
+    "@inertiajs/react": "3.6.1",
+    "@usecross/docs": "0.16.0",
+    "@fontsource-variable/archivo": "^5.3.0",
+    "@fontsource-variable/fira-code": "^5.3.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@inertiajs/vite": "3.6.1",
+    "@tailwindcss/typography": "0.5.20",
+    "@tailwindcss/vite": "4.3.3",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "@vitejs/plugin-react": "6.0.5",
+    "tailwindcss": "4.3.3",
+    "typescript": "7.0.2",
+    "vite": "8.2.0"
+  }
+}

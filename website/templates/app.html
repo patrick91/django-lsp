@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="Django ORM autocomplete that understands your models."
+    />
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+    {% if not head %}
+      <title>{{ page_title or "django-lsp" }}</title>
+    {% endif %}
+    <script>
+      (function () {
+        try {
+          var stored = localStorage.getItem("cross-docs-theme");
+          var theme =
+            stored === "light" || stored === "dark"
+              ? stored
+              : (stored === "system" || !stored) &&
+                  window.matchMedia("(prefers-color-scheme: dark)").matches
+                ? "dark"
+                : "light";
+          document.documentElement.classList.add(theme);
+        } catch (error) {}
+      })();
+    </script>
+    {{ inertia_head() }}
+  </head>
+  <body>
+    {{ inertia_body() }}
+  </body>
+</html>

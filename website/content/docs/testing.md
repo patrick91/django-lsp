@@ -1,3 +1,10 @@
+---
+title: Testing
+description: Run the Rust, protocol, executable documentation, and Django compatibility checks.
+section: Contributing
+order: 1
+---
+
 # Testing
 
 The test suite is split into layers so fast static-analysis checks remain easy to run while protocol
@@ -47,11 +54,11 @@ scan remains distinguishable from warm runs.
 
 ## Executable completion examples
 
-The human-facing [completion examples](completions.md) contain hidden scenario directives next to
+The human-facing [completion examples](/docs/completions/) contain hidden scenario directives next to
 their visible generated output. Each directive contains normal Python plus one `<cursor>` marker:
 
 ````markdown
-<!-- django-lsp-example file=blog/views.py limit=8
+<!-- django-lsp-example id=forward-relations file=blog/views.py limit=8
 from .models import Blog
 
 Blog.objects.filter(
@@ -59,15 +66,16 @@ Blog.objects.filter(
 )
 -->
 <!-- django-lsp-output:start -->
-```text
-The renderer writes the completion menu here.
-```
+<div class="completion-example">
+<AutocompleteDemo example="forward-relations" compact></AutocompleteDemo>
+</div>
 <!-- django-lsp-output:end -->
 ````
 
 The renderer opens that source through the real language server, requests completion at the marker,
-and rewrites only the adjacent output block. The scenario and its result therefore remain together
-in the existing documentation page.
+and rewrites only the adjacent output block with the visual component. It also updates
+`website/frontend/generated/completions.json`, which powers the visual autocomplete example on the
+home page. The scenario and website component therefore share one source of truth.
 
 Regenerate the checked-in page after an intentional completion change:
 
@@ -82,6 +90,24 @@ cargo run --bin render-docs -- --check
 ```
 
 `tests/markdown_docs.rs` runs the check as part of `cargo test --all-targets`.
+
+## Documentation website
+
+The CrossDocs application lives in `website`. Install its pinned Python and JavaScript dependencies,
+then run the type and production-build checks with:
+
+```console
+cd website
+uv sync --locked
+bun install --frozen-lockfile
+bun run check
+bun run build
+```
+
+Use `bun run serve` for a local preview at `http://localhost:8000`. Production builds create the client
+and server-rendering bundles consumed by the FastAPI application. The intended deployment target is
+FastAPI Cloud, with `django-lsp.patrick.wtf` attached through Cloudflare DNS when the domain is ready.
+An authenticated maintainer can build and deploy with `bun run deploy`.
 
 ## Editor extensions
 

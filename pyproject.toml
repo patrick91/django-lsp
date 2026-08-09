@@ -19,7 +19,7 @@ classifiers = [
 ]
 
 [project.urls]
-Documentation = "https://github.com/patrick91/django-lsp/tree/main/docs"
+Documentation = "https://django-lsp.patrick.wtf"
 Issues = "https://github.com/patrick91/django-lsp/issues"
 Repository = "https://github.com/patrick91/django-lsp"
 

@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+    <title>django-lsp</title>
+    <script>
+      (function () {
+        try {
+          var stored = localStorage.getItem("cross-docs-theme");
+          var theme =
+            stored === "light" || stored === "dark"
+              ? stored
+              : (stored === "system" || !stored) &&
+                  window.matchMedia("(prefers-color-scheme: dark)").matches
+                ? "dark"
+                : "light";
+          document.documentElement.classList.add(theme);
+        } catch (error) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/app.tsx"></script>
+  </body>
+</html>

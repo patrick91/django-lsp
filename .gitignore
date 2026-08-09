@@ -1,4 +1,10 @@
 /target
 /dist
+/website/.astro
+/website/.venv
+/website/dist
+/website/frontend/dist
+/website/node_modules
+/website/static/build
 __pycache__/
 *.py[cod]

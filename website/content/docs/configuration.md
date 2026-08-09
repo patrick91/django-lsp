@@ -1,3 +1,10 @@
+---
+title: Configuration
+description: Control how django-lsp discovers and indexes a Django workspace.
+section: Reference
+order: 1
+---
+
 # Configuration
 
 Configuration lives in the Django workspace's `pyproject.toml` under `tool.django-lsp`.

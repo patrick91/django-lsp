@@ -90,3 +90,30 @@ jobs:
           name: vscode-extension-universal
           path: extensions/vscode-extension/dist/django-lsp-universal.vsix
           if-no-files-found: error
+
+  website:
+    name: Documentation website
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: oven-sh/setup-bun@v2
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: website/uv.lock
+      - name: Install Python dependencies
+        run: uv sync --locked
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+      - name: Check website
+        run: bun run check
+      - name: Build website
+        run: bun run build
+      - name: Import FastAPI application
+        run: uv run python -c "from app import app; assert app.title == 'django-lsp'"
