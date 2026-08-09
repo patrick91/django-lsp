@@ -58,8 +58,8 @@ FastAPI and React application locally at `http://localhost:8000` with:
 ```console
 cd website
 uv sync --locked
-npm ci
-npm run serve
+bun install --frozen-lockfile
+bun run serve
 ```
 
 ## Current scope
@@ -89,9 +89,9 @@ Validate the documentation website separately with:
 ```console
 cd website
 uv sync --locked
-npm ci
-npm run check
-npm run build
+bun install --frozen-lockfile
+bun run check
+bun run build
 ```
 
 The project intentionally does not provide Django runtime introspection, general Python language

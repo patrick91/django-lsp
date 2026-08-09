@@ -99,15 +99,15 @@ then run the type and production-build checks with:
 ```console
 cd website
 uv sync --locked
-npm ci
-npm run check
-npm run build
+bun install --frozen-lockfile
+bun run check
+bun run build
 ```
 
-Use `npm run serve` for a local preview at `http://localhost:8000`. Production builds create the client
+Use `bun run serve` for a local preview at `http://localhost:8000`. Production builds create the client
 and server-rendering bundles consumed by the FastAPI application. The intended deployment target is
 FastAPI Cloud, with `django-lsp.patrick.wtf` attached through Cloudflare DNS when the domain is ready.
-An authenticated maintainer can build and deploy with `npm run deploy`.
+An authenticated maintainer can build and deploy with `bun run deploy`.
 
 ## Editor extensions
 

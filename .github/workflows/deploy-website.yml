@@ -22,21 +22,17 @@ jobs:
         working-directory: website
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: website/package-lock.json
+      - uses: oven-sh/setup-bun@v2
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
           cache-dependency-glob: website/uv.lock
       - name: Install frontend dependencies
-        run: npm ci
+        run: bun install --frozen-lockfile
       - name: Check website
-        run: npm run check
+        run: bun run check
       - name: Build website
-        run: npm run build
+        run: bun run build
       - name: Deploy to FastAPI Cloud
         run: uv run fastapi deploy
         env:
