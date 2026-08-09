@@ -18,7 +18,7 @@ two Actions variables: `AZURE_CLIENT_ID` and `AZURE_TENANT_ID`.
 The client ID belongs to a user-assigned Azure managed identity with:
 
 - a federated credential for the subject
-  `repo:patrick91@667029/django-lsp@1201471216:environment:vscode-marketplace` and audience
+  `repo:patrick91/django-lsp:environment:vscode-marketplace` and audience
   `api://AzureADTokenExchange`; and
 - Contributor access to the `patrick91` Visual Studio Marketplace publisher.
 
