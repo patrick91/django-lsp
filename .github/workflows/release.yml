@@ -114,6 +114,40 @@ jobs:
           path: extensions/vscode-extension/dist/*.vsix
           if-no-files-found: error
 
+  vscode-marketplace:
+    name: Publish VS Code Marketplace
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: vscode-extension
+    runs-on: ubuntu-24.04
+    environment: vscode-marketplace
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: extensions/vscode-extension/package-lock.json
+      - name: Log in to Azure with GitHub OIDC
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Download VS Code extensions
+        uses: actions/download-artifact@v8
+        with:
+          name: vscode-extensions
+          path: extensions/vscode-extension/dist
+      - name: Install publishing tools
+        working-directory: extensions/vscode-extension
+        run: npm ci
+      - name: Publish platform-specific extensions
+        working-directory: extensions/vscode-extension
+        run: npm exec -- vsce publish --azure-credential --skip-duplicate --packagePath dist/*.vsix
+
   github-release:
     name: Publish GitHub release
     if: startsWith(github.ref, 'refs/tags/v')

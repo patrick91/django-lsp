@@ -1,23 +1,36 @@
-# django-lsp for Visual Studio Code
+# Django ORM Language Server
 
-This extension runs [`django-lsp`](https://github.com/patrick91/django-lsp) alongside Pylance,
-Pyright, Ruff, or another general Python language server. It attaches only to Python files and adds
-Django ORM query completions.
+Static Django ORM query completions for Visual Studio Code and Cursor, powered by Rust.
 
-## Development installation
+`django-lsp` understands model fields, relationships, and query lookups without importing or
+executing your Django project. It runs alongside Pylance, Pyright, Ruff, or another general Python
+language server and contributes only Django-specific completions.
 
-Until the extension is published to the Visual Studio Marketplace and Open VSX, build an
-installable VSIX from the repository:
-
-```console
-cd extensions/vscode-extension
-npm ci
-npm run package:universal
-code --install-extension dist/django-lsp-universal.vsix
+```python
+Blog.objects.filter(author__team__name__icontains="Django")
 ```
 
-The universal development package expects `django-lsp` on `PATH` or an explicit executable path in
-settings. Tagged releases will also produce platform-specific VSIX packages containing the server.
+## Features
+
+- Model field completions in `filter`, `exclude`, and `get`
+- Forward, reverse, and recursive relationship traversal
+- Django field lookups such as `contains`, `icontains`, and `isnull`
+- Relation completions in `select_related` and `prefetch_related`
+- `AUTH_USER_MODEL`, package re-exports, monorepos, and multi-root workspaces
+- Unsaved editor buffer updates
+
+Explore the [visual completion examples](https://django-lsp.patrick.wtf/docs/completions) for the
+current supported query patterns.
+
+## Installation
+
+Install **Django ORM Language Server** from the
+[Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=patrick91.django-lsp).
+Platform-specific packages include the native `django-lsp` server, so no separate Python or Rust
+installation is required on supported macOS, Linux, and Windows systems.
+
+Open a Django project containing `manage.py` or `pyproject.toml`, then start typing inside a
+supported ORM query. The extension starts automatically for Python files.
 
 ## Server resolution
 
@@ -27,7 +40,8 @@ The extension resolves the server in this order:
 2. `django-lsp` from the VS Code extension host's `PATH`.
 3. The executable bundled in a platform-specific VSIX.
 
-Install the server from PyPI when using the universal development package:
+Install the server from PyPI only when using the universal development package or an unsupported
+platform:
 
 ```console
 uv tool install django-lsp
@@ -64,7 +78,28 @@ Override detection per workspace folder when a project uses another layout:
 
 Relative values resolve from the containing workspace folder; absolute paths are also supported.
 
+## Troubleshooting
+
+Open **View: Output**, select **django-lsp**, and check the server log. Set
+`djangoLsp.trace.server` to `messages` or `verbose` when protocol tracing is needed.
+
+Use **django-lsp: Restart Django ORM Language Server** after changing the executable or workspace
+root. See the complete [configuration guide](https://django-lsp.patrick.wtf/docs/configuration) for
+project indexing options.
+
 ## Development
+
+Build an installable universal VSIX from the repository:
+
+```console
+cd extensions/vscode-extension
+npm ci
+npm run package:universal
+code --install-extension dist/django-lsp-universal.vsix
+```
+
+The universal development package expects `django-lsp` on `PATH` or an explicit executable path in
+settings.
 
 Run the TypeScript tests, type checker, and production bundler:
 

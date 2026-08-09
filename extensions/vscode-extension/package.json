@@ -1,11 +1,21 @@
 {
   "name": "django-lsp",
   "displayName": "Django ORM Language Server",
-  "description": "Django ORM query completions for Python",
+  "description": "Django ORM query completions powered by a bundled Rust language server.",
   "version": "0.1.5",
   "publisher": "patrick91",
   "private": true,
-  "license": "MIT",
+  "license": "SEE LICENSE IN LICENSE",
+  "icon": "icon.png",
+  "galleryBanner": {
+    "color": "#ffffff",
+    "theme": "light"
+  },
+  "pricing": "Free",
+  "homepage": "https://django-lsp.patrick.wtf",
+  "bugs": {
+    "url": "https://github.com/patrick91/django-lsp/issues"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/patrick91/django-lsp.git",
