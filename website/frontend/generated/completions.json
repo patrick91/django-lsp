@@ -1,0 +1,242 @@
+[
+  {
+    "id": "model-fields",
+    "fixture": "blog/views.py",
+    "source": "from .models import Blog\n\nBlog.objects.filter(\n    ti\n)",
+    "cursor": {
+      "line": 3,
+      "character": 6
+    },
+    "items": [
+      "title",
+      "title__exact",
+      "title__iexact",
+      "title__icontains",
+      "title__contains",
+      "title__startswith",
+      "title__istartswith",
+      "title__endswith",
+      "title__iendswith",
+      "title__in",
+      "title__isnull",
+      "title__gt",
+      "title__gte",
+      "title__lt",
+      "title__lte"
+    ],
+    "visibleItems": 8,
+    "modelsFixture": "blog/models.py",
+    "modelsSource": "from django.conf import settings\nfrom django.db import models\n\n\nclass Team(models.Model):\n    name = models.CharField(max_length=64)\n\n\nclass Author(models.Model):\n    email = models.EmailField()\n    team = models.ForeignKey(Team, on_delete=models.CASCADE)\n\n\nclass Profile(models.Model):\n    author = models.OneToOneField(\n        Author,\n        on_delete=models.CASCADE,\n        related_name=\"profile\",\n    )\n    biography = models.TextField()\n\n\nclass Tag(models.Model):\n    name = models.CharField(max_length=64)\n\n\nclass Blog(models.Model):\n    title = models.CharField(max_length=255)\n    author = models.ForeignKey(\n        Author,\n        on_delete=models.CASCADE,\n        related_name=\"blogs\",\n        related_query_name=\"authored_blogs\",\n    )\n    tags = models.ManyToManyField(Tag, related_name=\"blogs\")\n\n\nclass Route(models.Model):\n    installer = models.ForeignKey(\n        settings.AUTH_USER_MODEL,\n        on_delete=models.CASCADE,\n        related_name=\"routes\",\n    )"
+  },
+  {
+    "id": "field-lookups",
+    "fixture": "blog/views.py",
+    "source": "from .models import Blog\n\nBlog.objects.filter(\n    title__\n)",
+    "cursor": {
+      "line": 3,
+      "character": 11
+    },
+    "items": [
+      "title__exact",
+      "title__iexact",
+      "title__icontains",
+      "title__contains",
+      "title__startswith",
+      "title__istartswith",
+      "title__endswith",
+      "title__iendswith",
+      "title__in",
+      "title__isnull",
+      "title__gt",
+      "title__gte",
+      "title__lt",
+      "title__lte"
+    ],
+    "visibleItems": 8,
+    "modelsFixture": "blog/models.py",
+    "modelsSource": "from django.conf import settings\nfrom django.db import models\n\n\nclass Team(models.Model):\n    name = models.CharField(max_length=64)\n\n\nclass Author(models.Model):\n    email = models.EmailField()\n    team = models.ForeignKey(Team, on_delete=models.CASCADE)\n\n\nclass Profile(models.Model):\n    author = models.OneToOneField(\n        Author,\n        on_delete=models.CASCADE,\n        related_name=\"profile\",\n    )\n    biography = models.TextField()\n\n\nclass Tag(models.Model):\n    name = models.CharField(max_length=64)\n\n\nclass Blog(models.Model):\n    title = models.CharField(max_length=255)\n    author = models.ForeignKey(\n        Author,\n        on_delete=models.CASCADE,\n        related_name=\"blogs\",\n        related_query_name=\"authored_blogs\",\n    )\n    tags = models.ManyToManyField(Tag, related_name=\"blogs\")\n\n\nclass Route(models.Model):\n    installer = models.ForeignKey(\n        settings.AUTH_USER_MODEL,\n        on_delete=models.CASCADE,\n        related_name=\"routes\",\n    )"
+  },
+  {
+    "id": "forward-relations",
+    "fixture": "blog/views.py",
+    "source": "from .models import Blog\n\nBlog.objects.filter(\n    author__te\n)",
+    "cursor": {
+      "line": 3,
+      "character": 14
+    },
+    "items": [
+      "author__team",
+      "author__team__name",
+      "author__team__author",
+      "author__team__exact",
+      "author__team__in",
+      "author__team__isnull",
+      "author__team__name__exact",
+      "author__team__author__exact",
+      "author__team__author__in",
+      "author__team__name__iexact",
+      "author__team__author__isnull",
+      "author__team__name__icontains",
+      "author__team__name__contains",
+      "author__team__name__startswith",
+      "author__team__name__istartswith",
+      "author__team__name__endswith",
+      "author__team__name__iendswith",
+      "author__team__name__in",
+      "author__team__name__isnull",
+      "author__team__name__gt",
+      "author__team__name__gte",
+      "author__team__name__lt",
+      "author__team__name__lte"
+    ],
+    "visibleItems": 8,
+    "modelsFixture": "blog/models.py",
+    "modelsSource": "from django.conf import settings\nfrom django.db import models\n\n\nclass Team(models.Model):\n    name = models.CharField(max_length=64)\n\n\nclass Author(models.Model):\n    email = models.EmailField()\n    team = models.ForeignKey(Team, on_delete=models.CASCADE)\n\n\nclass Profile(models.Model):\n    author = models.OneToOneField(\n        Author,\n        on_delete=models.CASCADE,\n        related_name=\"profile\",\n    )\n    biography = models.TextField()\n\n\nclass Tag(models.Model):\n    name = models.CharField(max_length=64)\n\n\nclass Blog(models.Model):\n    title = models.CharField(max_length=255)\n    author = models.ForeignKey(\n        Author,\n        on_delete=models.CASCADE,\n        related_name=\"blogs\",\n        related_query_name=\"authored_blogs\",\n    )\n    tags = models.ManyToManyField(Tag, related_name=\"blogs\")\n\n\nclass Route(models.Model):\n    installer = models.ForeignKey(\n        settings.AUTH_USER_MODEL,\n        on_delete=models.CASCADE,\n        related_name=\"routes\",\n    )"
+  },
+  {
+    "id": "deep-relation-paths",
+    "fixture": "blog/views.py",
+    "source": "from .models import Blog\n\nBlog.objects.filter(\n    author__team__na\n)",
+    "cursor": {
+      "line": 3,
+      "character": 20
+    },
+    "items": [
+      "author__team__name",
+      "author__team__name__exact",
+      "author__team__name__iexact",
+      "author__team__name__icontains",
+      "author__team__name__contains",
+      "author__team__name__startswith",
+      "author__team__name__istartswith",
+      "author__team__name__endswith",
+      "author__team__name__iendswith",
+      "author__team__name__in",
+      "author__team__name__isnull",
+      "author__team__name__gt",
+      "author__team__name__gte",
+      "author__team__name__lt",
+      "author__team__name__lte"
+    ],
+    "visibleItems": 8,
+    "modelsFixture": "blog/models.py",
+    "modelsSource": "from django.conf import settings\nfrom django.db import models\n\n\nclass Team(models.Model):\n    name = models.CharField(max_length=64)\n\n\nclass Author(models.Model):\n    email = models.EmailField()\n    team = models.ForeignKey(Team, on_delete=models.CASCADE)\n\n\nclass Profile(models.Model):\n    author = models.OneToOneField(\n        Author,\n        on_delete=models.CASCADE,\n        related_name=\"profile\",\n    )\n    biography = models.TextField()\n\n\nclass Tag(models.Model):\n    name = models.CharField(max_length=64)\n\n\nclass Blog(models.Model):\n    title = models.CharField(max_length=255)\n    author = models.ForeignKey(\n        Author,\n        on_delete=models.CASCADE,\n        related_name=\"blogs\",\n        related_query_name=\"authored_blogs\",\n    )\n    tags = models.ManyToManyField(Tag, related_name=\"blogs\")\n\n\nclass Route(models.Model):\n    installer = models.ForeignKey(\n        settings.AUTH_USER_MODEL,\n        on_delete=models.CASCADE,\n        related_name=\"routes\",\n    )"
+  },
+  {
+    "id": "many-to-many-relations",
+    "fixture": "blog/views.py",
+    "source": "from .models import Blog\n\nBlog.objects.filter(\n    tags__na\n)",
+    "cursor": {
+      "line": 3,
+      "character": 12
+    },
+    "items": [
+      "tags__name",
+      "tags__name__exact",
+      "tags__name__iexact",
+      "tags__name__icontains",
+      "tags__name__contains",
+      "tags__name__startswith",
+      "tags__name__istartswith",
+      "tags__name__endswith",
+      "tags__name__iendswith",
+      "tags__name__in",
+      "tags__name__isnull",
+      "tags__name__gt",
+      "tags__name__gte",
+      "tags__name__lt",
+      "tags__name__lte"
+    ],
+    "visibleItems": 8,
+    "modelsFixture": "blog/models.py",
+    "modelsSource": "from django.conf import settings\nfrom django.db import models\n\n\nclass Team(models.Model):\n    name = models.CharField(max_length=64)\n\n\nclass Author(models.Model):\n    email = models.EmailField()\n    team = models.ForeignKey(Team, on_delete=models.CASCADE)\n\n\nclass Profile(models.Model):\n    author = models.OneToOneField(\n        Author,\n        on_delete=models.CASCADE,\n        related_name=\"profile\",\n    )\n    biography = models.TextField()\n\n\nclass Tag(models.Model):\n    name = models.CharField(max_length=64)\n\n\nclass Blog(models.Model):\n    title = models.CharField(max_length=255)\n    author = models.ForeignKey(\n        Author,\n        on_delete=models.CASCADE,\n        related_name=\"blogs\",\n        related_query_name=\"authored_blogs\",\n    )\n    tags = models.ManyToManyField(Tag, related_name=\"blogs\")\n\n\nclass Route(models.Model):\n    installer = models.ForeignKey(\n        settings.AUTH_USER_MODEL,\n        on_delete=models.CASCADE,\n        related_name=\"routes\",\n    )"
+  },
+  {
+    "id": "reverse-relations",
+    "fixture": "blog/views.py",
+    "source": "from .models import Author\n\nAuthor.objects.filter(\n    authored_blogs__ti\n)",
+    "cursor": {
+      "line": 3,
+      "character": 22
+    },
+    "items": [
+      "authored_blogs__title",
+      "authored_blogs__title__exact",
+      "authored_blogs__title__iexact",
+      "authored_blogs__title__icontains",
+      "authored_blogs__title__contains",
+      "authored_blogs__title__startswith",
+      "authored_blogs__title__istartswith",
+      "authored_blogs__title__endswith",
+      "authored_blogs__title__iendswith",
+      "authored_blogs__title__in",
+      "authored_blogs__title__isnull",
+      "authored_blogs__title__gt",
+      "authored_blogs__title__gte",
+      "authored_blogs__title__lt",
+      "authored_blogs__title__lte"
+    ],
+    "visibleItems": 8,
+    "modelsFixture": "blog/models.py",
+    "modelsSource": "from django.conf import settings\nfrom django.db import models\n\n\nclass Team(models.Model):\n    name = models.CharField(max_length=64)\n\n\nclass Author(models.Model):\n    email = models.EmailField()\n    team = models.ForeignKey(Team, on_delete=models.CASCADE)\n\n\nclass Profile(models.Model):\n    author = models.OneToOneField(\n        Author,\n        on_delete=models.CASCADE,\n        related_name=\"profile\",\n    )\n    biography = models.TextField()\n\n\nclass Tag(models.Model):\n    name = models.CharField(max_length=64)\n\n\nclass Blog(models.Model):\n    title = models.CharField(max_length=255)\n    author = models.ForeignKey(\n        Author,\n        on_delete=models.CASCADE,\n        related_name=\"blogs\",\n        related_query_name=\"authored_blogs\",\n    )\n    tags = models.ManyToManyField(Tag, related_name=\"blogs\")\n\n\nclass Route(models.Model):\n    installer = models.ForeignKey(\n        settings.AUTH_USER_MODEL,\n        on_delete=models.CASCADE,\n        related_name=\"routes\",\n    )"
+  },
+  {
+    "id": "select-related",
+    "fixture": "blog/views.py",
+    "source": "from .models import Blog\n\nBlog.objects.select_related(\n    \"author__te\"\n)",
+    "cursor": {
+      "line": 3,
+      "character": 15
+    },
+    "items": [
+      "author__team"
+    ],
+    "visibleItems": 1,
+    "modelsFixture": "blog/models.py",
+    "modelsSource": "from django.conf import settings\nfrom django.db import models\n\n\nclass Team(models.Model):\n    name = models.CharField(max_length=64)\n\n\nclass Author(models.Model):\n    email = models.EmailField()\n    team = models.ForeignKey(Team, on_delete=models.CASCADE)\n\n\nclass Profile(models.Model):\n    author = models.OneToOneField(\n        Author,\n        on_delete=models.CASCADE,\n        related_name=\"profile\",\n    )\n    biography = models.TextField()\n\n\nclass Tag(models.Model):\n    name = models.CharField(max_length=64)\n\n\nclass Blog(models.Model):\n    title = models.CharField(max_length=255)\n    author = models.ForeignKey(\n        Author,\n        on_delete=models.CASCADE,\n        related_name=\"blogs\",\n        related_query_name=\"authored_blogs\",\n    )\n    tags = models.ManyToManyField(Tag, related_name=\"blogs\")\n\n\nclass Route(models.Model):\n    installer = models.ForeignKey(\n        settings.AUTH_USER_MODEL,\n        on_delete=models.CASCADE,\n        related_name=\"routes\",\n    )"
+  },
+  {
+    "id": "prefetch-related",
+    "fixture": "blog/views.py",
+    "source": "from .models import Author\n\nAuthor.objects.prefetch_related(\n    \"blogs__ta\"\n)",
+    "cursor": {
+      "line": 3,
+      "character": 14
+    },
+    "items": [
+      "blogs__tags"
+    ],
+    "visibleItems": 1,
+    "modelsFixture": "blog/models.py",
+    "modelsSource": "from django.conf import settings\nfrom django.db import models\n\n\nclass Team(models.Model):\n    name = models.CharField(max_length=64)\n\n\nclass Author(models.Model):\n    email = models.EmailField()\n    team = models.ForeignKey(Team, on_delete=models.CASCADE)\n\n\nclass Profile(models.Model):\n    author = models.OneToOneField(\n        Author,\n        on_delete=models.CASCADE,\n        related_name=\"profile\",\n    )\n    biography = models.TextField()\n\n\nclass Tag(models.Model):\n    name = models.CharField(max_length=64)\n\n\nclass Blog(models.Model):\n    title = models.CharField(max_length=255)\n    author = models.ForeignKey(\n        Author,\n        on_delete=models.CASCADE,\n        related_name=\"blogs\",\n        related_query_name=\"authored_blogs\",\n    )\n    tags = models.ManyToManyField(Tag, related_name=\"blogs\")\n\n\nclass Route(models.Model):\n    installer = models.ForeignKey(\n        settings.AUTH_USER_MODEL,\n        on_delete=models.CASCADE,\n        related_name=\"routes\",\n    )"
+  },
+  {
+    "id": "auth-user-model",
+    "fixture": "blog/views.py",
+    "source": "from .models import Route\n\nRoute.objects.filter(\n    installer__time\n)",
+    "cursor": {
+      "line": 3,
+      "character": 19
+    },
+    "items": [
+      "installer__timezone",
+      "installer__timezone__exact",
+      "installer__timezone__iexact",
+      "installer__timezone__icontains",
+      "installer__timezone__contains",
+      "installer__timezone__startswith",
+      "installer__timezone__istartswith",
+      "installer__timezone__endswith",
+      "installer__timezone__iendswith",
+      "installer__timezone__in",
+      "installer__timezone__isnull",
+      "installer__timezone__gt",
+      "installer__timezone__gte",
+      "installer__timezone__lt",
+      "installer__timezone__lte"
+    ],
+    "visibleItems": 8,
+    "modelsFixture": "blog/models.py",
+    "modelsSource": "from django.conf import settings\nfrom django.db import models\n\n\nclass Team(models.Model):\n    name = models.CharField(max_length=64)\n\n\nclass Author(models.Model):\n    email = models.EmailField()\n    team = models.ForeignKey(Team, on_delete=models.CASCADE)\n\n\nclass Profile(models.Model):\n    author = models.OneToOneField(\n        Author,\n        on_delete=models.CASCADE,\n        related_name=\"profile\",\n    )\n    biography = models.TextField()\n\n\nclass Tag(models.Model):\n    name = models.CharField(max_length=64)\n\n\nclass Blog(models.Model):\n    title = models.CharField(max_length=255)\n    author = models.ForeignKey(\n        Author,\n        on_delete=models.CASCADE,\n        related_name=\"blogs\",\n        related_query_name=\"authored_blogs\",\n    )\n    tags = models.ManyToManyField(Tag, related_name=\"blogs\")\n\n\nclass Route(models.Model):\n    installer = models.ForeignKey(\n        settings.AUTH_USER_MODEL,\n        on_delete=models.CASCADE,\n        related_name=\"routes\",\n    )"
+  }
+]

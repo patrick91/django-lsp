@@ -1,3 +1,10 @@
+---
+title: Getting started
+description: Install django-lsp and connect it to Cursor, Visual Studio Code, or Zed.
+section: Start
+order: 1
+---
+
 # Getting started
 
 ## Requirements
@@ -52,7 +59,7 @@ valid LSP stream.
 
 ### Visual Studio Code
 
-The first-party [Visual Studio Code extension](../extensions/vscode-extension) attaches
+The first-party [Visual Studio Code extension](https://github.com/patrick91/django-lsp/tree/main/extensions/vscode-extension) attaches
 `django-lsp` to Python files without replacing Pylance, Pyright, Ruff, or another general Python
 language server. Build and install its universal development package from the repository root:
 
@@ -75,7 +82,7 @@ path when explicit control is needed.
 
 ### Zed
 
-The first-party [Zed extension](../extensions/zed-extension) attaches `django-lsp` to Python files
+The first-party [Zed extension](https://github.com/patrick91/django-lsp/tree/main/extensions/zed-extension) attaches `django-lsp` to Python files
 without replacing Pyright, Pylsp, Ruff, or another general Python language server. Until the
 extension is available in Zed's gallery, clone this repository and run **zed: install dev
 extension**, selecting `extensions/zed-extension`.
@@ -107,6 +114,6 @@ The completion list should include paths such as `author__team`.
 
 ## Next steps
 
-- Browse the generated [completion examples](completions.md).
-- Add project-specific indexing rules in [configuration](configuration.md).
-- Use the protocol and documentation checks described in [testing](testing.md) when contributing.
+- Browse the generated [completion examples](/docs/completions/).
+- Add project-specific indexing rules in [configuration](/docs/configuration/).
+- Use the protocol and documentation checks described in [testing](/docs/testing/) when contributing.

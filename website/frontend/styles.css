@@ -1,0 +1,532 @@
+@import "@fontsource-variable/archivo/wdth.css";
+@import "@fontsource-variable/fira-code";
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+@import "@usecross/docs/styles.css";
+@source "../node_modules/@usecross/docs/src/**/*.tsx";
+@source "./**/*.tsx";
+
+@theme {
+  --font-heading: "Archivo Variable", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "Fira Code Variable", "Fira Code", ui-monospace, monospace;
+  --color-primary-50: color-mix(in srgb, #648c57 10%, white);
+  --color-primary-100: color-mix(in srgb, #648c57 20%, white);
+  --color-primary-200: color-mix(in srgb, #648c57 30%, white);
+  --color-primary-300: color-mix(in srgb, #648c57 50%, white);
+  --color-primary-400: color-mix(in srgb, #648c57 70%, white);
+  --color-primary-500: #648c57;
+  --color-primary-600: color-mix(in srgb, #648c57 90%, black);
+  --color-primary-700: color-mix(in srgb, #648c57 70%, black);
+  --color-primary-800: color-mix(in srgb, #648c57 50%, black);
+  --color-primary-900: color-mix(in srgb, #648c57 30%, black);
+  --color-primary-950: color-mix(in srgb, #648c57 15%, black);
+}
+
+@layer base {
+  :root {
+    --django-mono: var(--font-mono);
+    --cross-hairline: rgb(17 24 39 / 0.1);
+  }
+
+  :root.dark {
+    --cross-hairline: rgb(255 255 255 / 0.1);
+  }
+
+  #app {
+    isolation: isolate;
+  }
+}
+
+/* Generated editor view used on the homepage and in Markdown documentation. */
+.autocomplete-demo {
+  --code-size: 0.8125rem;
+  --row-h: 1.5rem;
+  --gutter: 2.5rem;
+  --code-ch: calc(var(--code-size) * 0.6);
+  --body-pad-top: 0.75rem;
+  --menu-size: 0.75rem;
+  --menu-row-h: 1.7rem;
+  --menu-w: 17.5rem;
+  --menu-more-h: 1.7rem;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  margin: 0;
+}
+
+.autocomplete-demo.compact {
+  margin: 1.5rem 0 2.5rem;
+}
+
+.autocomplete-demo:not(.compact) {
+  --split-pad: 1rem;
+  --gutter: calc(var(--split-pad) + 2.25rem);
+}
+
+.autocomplete-demo .completion-more {
+  margin: 0;
+}
+
+.editor-split {
+  display: grid;
+  min-width: 0;
+}
+
+.editor-split.split {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.editor-split.split .editor-tabs {
+  padding: var(--split-pad) var(--split-pad) 0;
+  border-bottom: 0;
+}
+
+.editor-split.split .editor-tab {
+  color: #71717a;
+  font-size: 0.8125rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.editor-split.split .editor-tab .tab-dir {
+  color: inherit;
+}
+
+.editor-split.split .editor-body {
+  padding-top: 1rem;
+  padding-bottom: var(--split-pad);
+  background: #000;
+}
+
+.editor-split.split .models-pane {
+  border: 0;
+}
+
+.editor-split.split .models-pane .pane-label {
+  padding: var(--split-pad) var(--split-pad) 0;
+  border-bottom: 0;
+  font-size: 0.8125rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.editor-split.split .models-pane .pane-label::before {
+  display: none;
+}
+
+.editor-split.split .models-pane .pane-label .tab-dir {
+  color: inherit;
+}
+
+.editor-split.split .models-lines {
+  padding: 1rem var(--split-pad) var(--split-pad);
+}
+
+.editor-shell {
+  position: relative;
+  overflow: hidden;
+  min-width: 0;
+  background: #000;
+  color: #e2e8f0;
+}
+
+.models-pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--cross-hairline);
+  border-left: 0;
+  background: #f7f7f4;
+  font-family: var(--django-mono);
+  font-size: var(--code-size);
+  line-height: var(--row-h);
+}
+
+.models-pane .pane-label {
+  display: flex;
+  align-items: center;
+  margin: 0;
+  padding: 0.625rem 1.25rem;
+  border-bottom: 1px solid rgb(17 24 39 / 0.06);
+  color: #6b7280;
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+
+.models-pane .pane-label::before {
+  width: 0.4375rem;
+  height: 0.4375rem;
+  flex: none;
+  margin-right: 0.625rem;
+  border-radius: 999px;
+  background: #c5c9bd;
+  content: "";
+}
+
+.models-pane .pane-label .tab-dir {
+  color: #9ca3af;
+}
+
+.models-lines {
+  overflow: hidden;
+  padding: var(--body-pad-top) 1.25rem 1rem;
+  mask-image: linear-gradient(to bottom, black calc(100% - 2.5rem), transparent);
+}
+
+.models-line {
+  min-height: var(--row-h);
+  overflow: hidden;
+  color: #374151;
+  white-space: pre;
+}
+
+.models-line.muted {
+  color: #9ca3af;
+}
+
+.models-pane .token-keyword {
+  color: #a04a72;
+}
+
+.models-pane .token-name {
+  color: #3454b4;
+}
+
+.models-pane .token-member {
+  color: #0f766e;
+}
+
+.models-pane .token-string {
+  color: #8a5a12;
+}
+
+.models-pane .token-comment {
+  color: #9ca3af;
+}
+
+.dark .models-pane {
+  background: #161616;
+}
+
+.dark .models-pane .pane-label {
+  border-bottom-color: rgb(255 255 255 / 0.06);
+  color: #a1a1aa;
+}
+
+.dark .models-pane .pane-label::before {
+  background: #3f4436;
+}
+
+.dark .models-pane .pane-label .tab-dir {
+  color: #71717a;
+}
+
+.dark .models-line {
+  color: #c0c2b3;
+}
+
+.dark .models-line.muted {
+  color: #6b7280;
+}
+
+.dark .models-pane .token-keyword {
+  color: #f472b6;
+}
+
+.dark .models-pane .token-name {
+  color: #7dd3fc;
+}
+
+.dark .models-pane .token-member {
+  color: #c4b5fd;
+}
+
+.dark .models-pane .token-string {
+  color: #86efac;
+}
+
+.dark .models-pane .token-comment {
+  color: #64748b;
+}
+
+.dark .completion-menu {
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 0.08);
+}
+
+.editor-tabs {
+  display: flex;
+  align-items: center;
+  padding: 0.625rem 1.25rem 0.625rem 1rem;
+  border-bottom: 1px solid rgb(255 255 255 / 0.06);
+}
+
+.editor-tab {
+  display: flex;
+  align-items: center;
+  color: #94a3b8;
+  font-family: var(--django-mono);
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+
+.editor-tab .tab-dir {
+  color: #71717a;
+}
+
+.editor-body {
+  --menu-top: calc(var(--body-pad-top) + (var(--cursor-line) + 1) * var(--row-h));
+  --menu-height: calc(
+    0.5rem + var(--completion-items) * var(--menu-row-h) +
+      var(--completion-more, 0) * var(--menu-more-h)
+  );
+  position: relative;
+  min-width: 0;
+  min-height: calc(var(--menu-top) + var(--menu-height) + 1.25rem);
+  padding: var(--body-pad-top) 0 1rem;
+  background:
+    linear-gradient(rgb(255 255 255 / 0.015) 1px, transparent 1px) 0 0 / 100%
+      var(--row-h),
+    #000;
+}
+
+.code-lines {
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.code-line {
+  display: grid;
+  grid-template-columns: var(--gutter) minmax(max-content, 1fr);
+  min-width: 34rem;
+  min-height: var(--row-h);
+  padding-right: 1.5rem;
+  font-family: var(--django-mono);
+  font-size: var(--code-size);
+  line-height: var(--row-h);
+}
+
+.code-line.has-cursor {
+  background: rgb(255 255 255 / 0.045);
+}
+
+.autocomplete-demo .code-line code {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #e2e8f0;
+  box-shadow: none;
+  font-size: inherit;
+  white-space: pre;
+}
+
+.line-number {
+  padding-right: 1rem;
+  color: #334155;
+  text-align: right;
+  user-select: none;
+  font-variant-numeric: tabular-nums;
+}
+
+.token-keyword {
+  color: #f472b6;
+}
+
+.token-name {
+  color: #7dd3fc;
+}
+
+.token-member {
+  color: #c4b5fd;
+}
+
+.token-string {
+  color: #86efac;
+}
+
+.token-comment {
+  color: #64748b;
+}
+
+.editor-caret {
+  display: inline-block;
+  width: 2px;
+  height: 1.25em;
+  vertical-align: -0.2em;
+  background: #f0fdf4;
+  box-shadow: 0 0 0.6rem rgb(134 239 172 / 0.6);
+}
+
+.completion-menu {
+  position: absolute;
+  top: var(--menu-top);
+  left: min(
+    calc(var(--gutter) + var(--cursor-column) * var(--code-ch)),
+    calc(100% - var(--menu-w) - 1.5rem)
+  );
+  z-index: 2;
+  width: var(--menu-w);
+  overflow: hidden;
+  border: 1px solid #2e2e2e;
+  background: #141414;
+  color: #d4d4d8;
+  box-shadow:
+    0 1.5rem 3rem rgb(0 0 0 / 0.45),
+    0 0.375rem 1rem rgb(0 0 0 / 0.35);
+}
+
+.completion-menu ul {
+  margin: 0;
+  padding: 0.25rem;
+  list-style: none;
+}
+
+.completion-menu li {
+  display: flex;
+  min-height: var(--menu-row-h);
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0;
+  padding: 0 0.5rem;
+  font-family: var(--django-mono);
+  font-size: var(--menu-size);
+}
+
+.completion-menu li.selected {
+  background: #232323;
+}
+
+.completion-icon {
+  display: flex;
+  width: 1rem;
+  height: 1rem;
+  flex: none;
+  align-items: center;
+}
+
+.completion-icon svg {
+  width: 100%;
+  height: 100%;
+}
+
+.completion-icon.kind-field {
+  color: #7dd3fc;
+}
+
+.completion-icon.kind-lookup {
+  color: #86efac;
+}
+
+.completion-label {
+  min-width: 0;
+  overflow: hidden;
+  color: #d4d4d8;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.completion-menu li.selected .completion-label {
+  color: #fafafa;
+}
+
+.completion-match {
+  color: #86efac;
+  font-weight: 700;
+}
+
+.completion-more {
+  display: flex;
+  height: var(--menu-more-h);
+  align-items: center;
+  padding: 0 0.75rem;
+  border-top: 1px solid #242424;
+  color: #71717a;
+  font-size: calc(var(--menu-size) - 0.0625rem);
+}
+
+.completion-menu-quiet {
+  border-color: #262626;
+  background: #111;
+  box-shadow: none;
+}
+
+.completion-menu-quiet ul {
+  padding: 0;
+}
+
+.completion-menu-quiet li {
+  border-left: 2px solid transparent;
+  padding-right: 0.75rem;
+  padding-left: 0.625rem;
+}
+
+.completion-menu-quiet li.selected {
+  border-left-color: #86efac;
+  background: rgb(134 239 172 / 0.06);
+}
+
+.completion-menu-quiet .completion-icon {
+  color: #71717a;
+}
+
+.completion-menu-quiet li.selected .completion-icon {
+  color: #86efac;
+}
+
+@media (max-width: 46rem) {
+  .autocomplete-demo:not(.compact) {
+    --split-pad: 1rem;
+    --gutter: 2.75rem;
+  }
+
+  .editor-split.split .editor-tabs {
+    padding-left: var(--split-pad);
+  }
+
+  .editor-split.split .models-pane .pane-label,
+  .editor-split.split .models-lines {
+    padding-left: var(--split-pad);
+  }
+
+  .editor-body {
+    min-height: 0;
+    padding-bottom: 1rem;
+  }
+
+  .code-lines {
+    padding-bottom: 0.5rem;
+  }
+
+  .editor-split.split {
+    grid-template-columns: 1fr;
+  }
+
+  .completion-menu {
+    position: relative;
+    top: auto;
+    left: auto;
+    width: auto;
+    margin: 0.5rem 0.75rem 0 2.75rem;
+    box-shadow: none;
+  }
+
+  .completion-menu li {
+    min-height: 2.5rem;
+    padding: 0.25rem 0.5rem;
+    font-size: 0.9375rem;
+  }
+
+  .completion-more {
+    font-size: 0.875rem;
+  }
+}
+
+@media (min-width: 64rem) {
+  .autocomplete-demo:not(.compact) {
+    --split-pad: 2.5rem;
+  }
+}

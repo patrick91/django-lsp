@@ -1,0 +1,46 @@
+[project]
+name = "django-lsp-website"
+version = "0.1.0"
+description = "Documentation website for django-lsp"
+requires-python = ">=3.10"
+dependencies = [
+    "cross-docs==0.16.0",
+    "fastapi[standard]>=0.141.0",
+    "jinja2>=3.1.6",
+]
+
+[tool.cross-docs]
+content_dir = "content"
+prefix = "/docs"
+index_page = "getting-started"
+section_order = ["Start", "Guides", "Reference", "Contributing"]
+github_url = "https://github.com/patrick91/django-lsp"
+
+[[tool.cross-docs.nav_links]]
+label = "Docs"
+href = "/docs/"
+
+[tool.cross-docs.home]
+enabled = true
+component = "Home"
+title = "django-lsp"
+description = "Django ORM autocomplete that understands your models. Follow fields and relations without importing Django or running your project."
+install_command = "uv tool install django-lsp"
+cta_text = "Get Started"
+cta_href = "/docs/"
+
+[[tool.cross-docs.home.features]]
+title = "Static by design"
+description = "Indexes Python source without initializing Django, connecting to a database, or executing project code."
+
+[[tool.cross-docs.home.features]]
+title = "Relation aware"
+description = "Traverses forward, reverse, many-to-many, and configured user-model relationships."
+
+[[tool.cross-docs.home.features]]
+title = "Editor friendly"
+description = "Runs alongside Pylance, Pyright, Ruff, or another general-purpose Python language server."
+
+[[tool.cross-docs.home.features]]
+title = "Responsive indexing"
+description = "Caches and debounces workspace indexing, so completions stay fresh while you type."

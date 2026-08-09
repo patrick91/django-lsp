@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -7,6 +8,7 @@ use std::process;
 use std::sync::Arc;
 
 use django_lsp::server::{Backend, ServerState};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tower::{Service, ServiceExt};
 use tower_lsp_server::LspService;
@@ -15,13 +17,20 @@ use tower_lsp_server::jsonrpc::{Request, Response};
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 const CURSOR_MARKER: &str = "<cursor>";
-const EXAMPLE_PREFIX: &str = "<!-- django-lsp-example";
-const EXAMPLE_END: &str = "-->";
-const OUTPUT_START: &str = "<!-- django-lsp-output:start -->";
-const OUTPUT_END: &str = "<!-- django-lsp-output:end -->";
+const MARKDOWN_EXAMPLE_PREFIX: &str = "<!-- django-lsp-example";
+const MARKDOWN_EXAMPLE_END: &str = "-->";
+const MARKDOWN_OUTPUT_START: &str = "<!-- django-lsp-output:start -->";
+const MARKDOWN_OUTPUT_END: &str = "<!-- django-lsp-output:end -->";
+const MDX_EXAMPLE_PREFIX: &str = "{/* django-lsp-example";
+const MDX_EXAMPLE_END: &str = "*/}";
+const MDX_OUTPUT_START: &str = "{/* django-lsp-output:start */}";
+const MDX_OUTPUT_END: &str = "{/* django-lsp-output:end */}";
+const DOCS_ROOT: &str = "website/content/docs";
+const GENERATED_EXAMPLES: &str = "website/frontend/generated/completions.json";
 
 #[derive(Debug)]
 struct ExampleOptions {
+    id: String,
     file: PathBuf,
     limit: usize,
 }
@@ -30,6 +39,39 @@ struct ExampleOptions {
 struct RenderedDocument {
     path: PathBuf,
     contents: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeneratedExample {
+    id: String,
+    fixture: String,
+    source: String,
+    cursor: GeneratedCursor,
+    items: Vec<String>,
+    visible_items: usize,
+    models_fixture: String,
+    models_source: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GeneratedCursor {
+    line: usize,
+    character: usize,
+}
+
+#[derive(Debug)]
+struct RenderedExample {
+    menu: String,
+    generated: GeneratedExample,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExampleSyntax {
+    example_end: &'static str,
+    output_start: &'static str,
+    output_end: &'static str,
+    supports_components: bool,
 }
 
 #[tokio::main]
@@ -48,16 +90,22 @@ async fn run() -> Result<()> {
     };
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let documents = render_documents(root).await?;
+    let (mut documents, examples) = render_documents(root).await?;
+    documents.push(RenderedDocument {
+        path: root.join(GENERATED_EXAMPLES),
+        contents: format!("{}\n", serde_json::to_string_pretty(&examples)?),
+    });
     let mut stale = Vec::new();
 
     for document in documents {
-        let current = fs::read_to_string(&document.path)?;
         if check {
-            if current != document.contents {
+            if fs::read_to_string(&document.path).ok().as_deref() != Some(&document.contents) {
                 stale.push(document.path);
             }
         } else {
+            if let Some(parent) = document.path.parent() {
+                fs::create_dir_all(parent)?;
+            }
             fs::write(&document.path, document.contents)?;
             println!("rendered {}", relative_path(root, &document.path));
         }
@@ -80,36 +128,71 @@ async fn run() -> Result<()> {
     )))
 }
 
-async fn render_documents(root: &Path) -> Result<Vec<RenderedDocument>> {
-    let docs_root = root.join("docs");
-    let mut paths = fs::read_dir(&docs_root)?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().is_some_and(|extension| extension == "md"))
-        .collect::<Vec<_>>();
-    paths.sort();
+async fn render_documents(root: &Path) -> Result<(Vec<RenderedDocument>, Vec<GeneratedExample>)> {
+    let docs_root = root.join(DOCS_ROOT);
+    let paths = markdown_paths(&docs_root)?;
 
     let mut documents = Vec::new();
+    let mut examples = Vec::new();
+    let mut example_ids = HashSet::new();
     for path in paths {
         let source = fs::read_to_string(&path)?;
-        let (contents, example_count) = render_markdown(root, &path, &source).await?;
-        if example_count > 0 {
+        let (contents, document_examples) = render_markdown(root, &path, &source).await?;
+        if !document_examples.is_empty() {
+            for example in &document_examples {
+                if !example_ids.insert(example.id.clone()) {
+                    return Err(message(format!(
+                        "duplicate django-lsp example id `{}`",
+                        example.id
+                    )));
+                }
+            }
+            examples.extend(document_examples);
             documents.push(RenderedDocument { path, contents });
         }
     }
 
     if documents.is_empty() {
-        return Err(message("no executable Markdown examples found in docs"));
+        return Err(message(format!(
+            "no executable Markdown examples found in {DOCS_ROOT}"
+        )));
     }
 
-    Ok(documents)
+    Ok((documents, examples))
 }
 
-async fn render_markdown(root: &Path, path: &Path, markdown: &str) -> Result<(String, usize)> {
+fn markdown_paths(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut directories = vec![root.to_path_buf()];
+    let mut paths = Vec::new();
+
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                directories.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "md" || extension == "mdx")
+            {
+                paths.push(path);
+            }
+        }
+    }
+
+    paths.sort();
+    Ok(paths)
+}
+
+async fn render_markdown(
+    root: &Path,
+    path: &Path,
+    markdown: &str,
+) -> Result<(String, Vec<GeneratedExample>)> {
     let lines = markdown.lines().collect::<Vec<_>>();
     let mut rendered = String::new();
     let mut line_index = 0;
     let mut markdown_fence = None;
-    let mut example_count = 0;
+    let mut examples = Vec::new();
 
     while line_index < lines.len() {
         let line = lines[line_index];
@@ -130,7 +213,7 @@ async fn render_markdown(root: &Path, path: &Path, markdown: &str) -> Result<(St
             continue;
         }
 
-        let Some(option_text) = line.strip_prefix(EXAMPLE_PREFIX) else {
+        let Some((option_text, syntax)) = example_start(line) else {
             rendered.push_str(line);
             rendered.push('\n');
             line_index += 1;
@@ -138,12 +221,11 @@ async fn render_markdown(root: &Path, path: &Path, markdown: &str) -> Result<(St
         };
 
         let options = parse_options(option_text, path, line_index + 1)?;
-        example_count += 1;
         rendered.push_str(line);
         rendered.push('\n');
         line_index += 1;
         let source_start = line_index;
-        while line_index < lines.len() && lines[line_index] != EXAMPLE_END {
+        while line_index < lines.len() && lines[line_index] != syntax.example_end {
             rendered.push_str(lines[line_index]);
             rendered.push('\n');
             line_index += 1;
@@ -157,20 +239,21 @@ async fn render_markdown(root: &Path, path: &Path, markdown: &str) -> Result<(St
         }
 
         let source = lines[source_start..line_index].join("\n");
-        rendered.push_str(EXAMPLE_END);
+        rendered.push_str(syntax.example_end);
         rendered.push('\n');
         line_index += 1;
-        if lines.get(line_index) != Some(&OUTPUT_START) {
+        if lines.get(line_index) != Some(&syntax.output_start) {
             return Err(message(format!(
-                "{}:{}: django-lsp example must be followed by `{OUTPUT_START}`",
+                "{}:{}: django-lsp example must be followed by `{}`",
                 path.display(),
-                line_index + 1
+                line_index + 1,
+                syntax.output_start
             )));
         }
-        rendered.push_str(OUTPUT_START);
+        rendered.push_str(syntax.output_start);
         rendered.push('\n');
         line_index += 1;
-        while line_index < lines.len() && lines[line_index] != OUTPUT_END {
+        while line_index < lines.len() && lines[line_index] != syntax.output_end {
             line_index += 1;
         }
         if line_index == lines.len() {
@@ -186,15 +269,53 @@ async fn render_markdown(root: &Path, path: &Path, markdown: &str) -> Result<(St
             .map_err(|error| {
                 message(format!("{}:{}: {error}", path.display(), source_start + 1))
             })?;
-        rendered.push_str("```text\n");
-        rendered.push_str(&example);
-        rendered.push_str("\n```\n");
-        rendered.push_str(OUTPUT_END);
+        if syntax.supports_components {
+            rendered.push_str(&format!(
+                concat!(
+                    "<div class=\"completion-example\">\n",
+                    "<AutocompleteDemo example=\"{}\" compact></AutocompleteDemo>\n",
+                    "</div>\n"
+                ),
+                example.generated.id
+            ));
+        } else {
+            rendered.push_str("```text\n");
+            rendered.push_str(&example.menu);
+            rendered.push_str("\n```\n");
+        }
+        rendered.push_str(syntax.output_end);
         rendered.push('\n');
+        examples.push(example.generated);
         line_index += 1;
     }
 
-    Ok((rendered, example_count))
+    Ok((rendered, examples))
+}
+
+fn example_start(line: &str) -> Option<(&str, ExampleSyntax)> {
+    if let Some(options) = line.strip_prefix(MDX_EXAMPLE_PREFIX) {
+        return Some((
+            options,
+            ExampleSyntax {
+                example_end: MDX_EXAMPLE_END,
+                output_start: MDX_OUTPUT_START,
+                output_end: MDX_OUTPUT_END,
+                supports_components: true,
+            },
+        ));
+    }
+
+    line.strip_prefix(MARKDOWN_EXAMPLE_PREFIX).map(|options| {
+        (
+            options,
+            ExampleSyntax {
+                example_end: MARKDOWN_EXAMPLE_END,
+                output_start: MARKDOWN_OUTPUT_START,
+                output_end: MARKDOWN_OUTPUT_END,
+                supports_components: true,
+            },
+        )
+    })
 }
 
 fn opening_fence(line: &str) -> Option<(char, usize)> {
@@ -220,6 +341,7 @@ fn is_closing_fence(line: &str, marker: char, minimum_length: usize) -> bool {
 }
 
 fn parse_options(text: &str, path: &Path, line: usize) -> Result<ExampleOptions> {
+    let mut id = None;
     let mut file = None;
     let mut limit = 8;
 
@@ -231,6 +353,21 @@ fn parse_options(text: &str, path: &Path, line: usize) -> Result<ExampleOptions>
             ))
         })?;
         match key {
+            "id" => {
+                if value.is_empty()
+                    || !value.chars().all(|character| {
+                        character.is_ascii_lowercase()
+                            || character.is_ascii_digit()
+                            || character == '-'
+                    })
+                {
+                    return Err(message(format!(
+                        "{}:{line}: id must contain lowercase ASCII letters, numbers, or hyphens",
+                        path.display()
+                    )));
+                }
+                id = Some(value.to_owned());
+            }
             "file" => file = Some(PathBuf::from(value)),
             "limit" => {
                 limit = value.parse::<usize>().map_err(|_| {
@@ -256,6 +393,12 @@ fn parse_options(text: &str, path: &Path, line: usize) -> Result<ExampleOptions>
     }
 
     Ok(ExampleOptions {
+        id: id.ok_or_else(|| {
+            message(format!(
+                "{}:{line}: django-lsp examples require an id option",
+                path.display()
+            ))
+        })?,
         file: file.ok_or_else(|| {
             message(format!(
                 "{}:{line}: django-lsp examples require a file option",
@@ -266,7 +409,11 @@ fn parse_options(text: &str, path: &Path, line: usize) -> Result<ExampleOptions>
     })
 }
 
-async fn render_example(root: &Path, options: &ExampleOptions, source: &str) -> Result<String> {
+async fn render_example(
+    root: &Path,
+    options: &ExampleOptions,
+    source: &str,
+) -> Result<RenderedExample> {
     let marker_count = source.matches(CURSOR_MARKER).count();
     if marker_count != 1 {
         return Err(message(format!(
@@ -287,12 +434,37 @@ async fn render_example(root: &Path, options: &ExampleOptions, source: &str) -> 
         return Err(message("the language server returned no completions"));
     }
 
-    Ok(render_completion_menu(
-        &source,
-        cursor,
-        &labels,
-        options.limit,
-    ))
+    let menu = render_completion_menu(&source, cursor, &labels, options.limit);
+    let visible_items = labels.len().min(options.limit);
+
+    let models_fixture = options
+        .file
+        .parent()
+        .map(|directory| directory.join("models.py"))
+        .unwrap_or_else(|| PathBuf::from("models.py"));
+    let models_source = fs::read_to_string(fixture_root.join(&models_fixture))
+        .map_err(|error| {
+            message(format!(
+                "failed to read {}: {error}",
+                models_fixture.display()
+            ))
+        })?
+        .trim_end()
+        .to_string();
+
+    Ok(RenderedExample {
+        menu,
+        generated: GeneratedExample {
+            id: options.id.clone(),
+            fixture: options.file.display().to_string(),
+            source: source.clone(),
+            cursor: cursor_position(&source, cursor),
+            items: labels,
+            visible_items,
+            models_fixture: models_fixture.display().to_string(),
+            models_source,
+        },
+    })
 }
 
 async fn completion_labels(
@@ -368,14 +540,20 @@ async fn send(service: &mut LspService<Backend>, request: Request) -> Result<Opt
 }
 
 fn position_at(source: &str, offset: usize) -> Value {
+    let cursor = cursor_position(source, offset);
+    json!({"line": cursor.line, "character": cursor.character})
+}
+
+fn cursor_position(source: &str, offset: usize) -> GeneratedCursor {
     let prefix = &source[..offset];
-    let line = prefix.bytes().filter(|byte| *byte == b'\n').count();
-    let character = prefix
-        .rsplit_once('\n')
-        .map_or(prefix, |(_, line)| line)
-        .encode_utf16()
-        .count();
-    json!({"line": line, "character": character})
+    GeneratedCursor {
+        line: prefix.bytes().filter(|byte| *byte == b'\n').count(),
+        character: prefix
+            .rsplit_once('\n')
+            .map_or(prefix, |(_, line)| line)
+            .encode_utf16()
+            .count(),
+    }
 }
 
 fn render_completion_menu(source: &str, cursor: usize, labels: &[String], limit: usize) -> String {

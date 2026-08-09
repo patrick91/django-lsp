@@ -44,12 +44,23 @@ development installation while its extension-gallery submission is in progress.
 
 ## Documentation
 
-- [Getting started](docs/getting-started.md) covers installing, building, and connecting an editor.
-- [Completion examples](docs/completions.md) shows executable examples generated from the real LSP.
-- [Configuration](docs/configuration.md) documents `pyproject.toml` options.
-- [Testing](docs/testing.md) explains the Rust, protocol, documentation, and Django compatibility
-  test layers.
-- [Documentation index](docs/README.md) provides the complete guide map.
+- [Getting started](website/content/docs/getting-started.md) covers installing, building, and
+  connecting an editor.
+- [Completion examples](website/content/docs/completions.md) shows executable examples generated
+  from the real LSP.
+- [Configuration](website/content/docs/configuration.md) documents `pyproject.toml` options.
+- [Testing](website/content/docs/testing.md) explains the Rust, protocol, documentation, and
+  Django compatibility test layers.
+
+The website uses CrossDocs, the same documentation framework as Cross-Inertia. Preview the complete
+FastAPI and React application locally at `http://localhost:8000` with:
+
+```console
+cd website
+uv sync --locked
+npm ci
+npm run serve
+```
 
 ## Current scope
 
@@ -71,6 +82,16 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo run --bin render-docs -- --check
 cargo test --all-targets
+```
+
+Validate the documentation website separately with:
+
+```console
+cd website
+uv sync --locked
+npm ci
+npm run check
+npm run build
 ```
 
 The project intentionally does not provide Django runtime introspection, general Python language
