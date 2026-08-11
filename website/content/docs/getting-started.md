@@ -17,7 +17,9 @@ importing the project.
 
 ## Install the server
 
-The recommended installation uses `uv` to keep the executable isolated from project dependencies:
+Visual Studio Code and Cursor users can skip this step because the platform-specific extension
+packages bundle the server. For Zed, another LSP client, or extension development, the recommended
+installation uses `uv` to keep the executable isolated from project dependencies:
 
 ```console
 uv tool install django-lsp
@@ -57,23 +59,24 @@ Configure a Python language-server entry with:
 The server writes diagnostics and lifecycle logging to standard error so standard output remains a
 valid LSP stream.
 
-### Visual Studio Code
+### Visual Studio Code and Cursor
 
-The first-party [Visual Studio Code extension](https://github.com/patrick91/django-lsp/tree/main/extensions/vscode-extension) attaches
-`django-lsp` to Python files without replacing Pylance, Pyright, Ruff, or another general Python
-language server. Build and install its universal development package from the repository root:
+Install **Django ORM Language Server** from the built-in Extensions view. The extension is
+published on the
+[Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=patrick91.django-lsp)
+for Visual Studio Code and [Open VSX](https://open-vsx.org/extension/patrick91/django-lsp) for
+Cursor. It attaches `django-lsp` to Python files without replacing Pylance, Pyright, Ruff, or
+another general Python language server.
 
-```console
-cd extensions/vscode-extension
-npm ci
-npm run package:universal
-code --install-extension dist/django-lsp-universal.vsix
-```
+The platform-specific packages include the matching native server, so no separate Python or Rust
+installation is required on supported macOS, Linux, and Windows systems. To install manually,
+download the VSIX for your platform from the
+[latest GitHub release](https://github.com/patrick91/django-lsp/releases/latest), then run
+**Extensions: Install from VSIX...** from the editor's command palette.
 
-The universal package uses `djangoLsp.server.path` when configured, then looks for `django-lsp` on
-`PATH`. Platform-specific release packages additionally contain the matching server executable.
-Use **django-lsp: Restart Django ORM Language Server** after changing the executable or project
-configuration.
+The extension uses `djangoLsp.server.path` when configured, then looks for `django-lsp` on `PATH`,
+then uses its bundled executable. Use **django-lsp: Restart Django ORM Language Server** after
+changing the executable or project configuration.
 
 In a monorepo or multi-root workspace, the extension starts a client per detected Django project.
 It searches upward from each opened Python file for `manage.py`, then `pyproject.toml`, without

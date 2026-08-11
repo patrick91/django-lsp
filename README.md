@@ -30,14 +30,15 @@ input and output for LSP communication.
 
 ### Visual Studio Code
 
-Install the [Django ORM Language Server extension](https://marketplace.visualstudio.com/items?itemName=patrick91.django-lsp)
-from the Visual Studio Marketplace in Visual Studio Code. It runs `django-lsp` alongside Pylance,
-Pyright, Ruff, or another general Python language server and bundles the native server for supported
-platforms.
+Install **Django ORM Language Server** from the built-in Extensions view in Visual Studio Code or
+Cursor. It is published on the
+[Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=patrick91.django-lsp)
+and [Open VSX](https://open-vsx.org/extension/patrick91/django-lsp). The extension runs `django-lsp`
+alongside Pylance, Pyright, Ruff, or another general Python language server and bundles the native
+server for supported platforms.
 
-Cursor uses an Open VSX-compatible extension gallery. Until the Open VSX publication is available,
-download the VSIX for your platform from the [latest GitHub release](https://github.com/patrick91/django-lsp/releases/latest)
-and run **Extensions: Install from VSIX...** in Cursor. See the
+Platform-specific VSIX files are also available from the
+[latest GitHub release](https://github.com/patrick91/django-lsp/releases/latest). See the
 [extension README](extensions/vscode-extension) for configuration and development installation.
 
 ### Zed
