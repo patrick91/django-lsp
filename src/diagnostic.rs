@@ -4,7 +4,10 @@ use ruff_python_ast::visitor::{self, Visitor};
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_text_size::{Ranged, TextRange};
 
-use crate::index::{ModelId, ModuleAnalysis, WorkspaceIndex, apply_import_statement, qualify_expr};
+use crate::index::{
+    CallableIndex, CallableSummary, ModelId, ModuleAnalysis, WorkspaceIndex,
+    apply_import_statement, qualify_expr,
+};
 
 pub const MISSING_EAGER_LOAD: &str = "DJ001";
 
@@ -58,14 +61,19 @@ struct Scope {
     imports: HashMap<String, String>,
     queries: HashMap<String, QueryState>,
     repeated_items: HashMap<String, QueryState>,
+    model_instances: HashMap<String, QueryState>,
+    class_model: Option<ModelId>,
+    class_instance_state: Option<QueryState>,
 }
 
 pub fn analyze_diagnostics(
     index: &WorkspaceIndex,
+    callables: &CallableIndex,
     analysis: &ModuleAnalysis,
 ) -> Vec<OrmDiagnostic> {
     let mut analyzer = Analyzer {
         index,
+        callables,
         analysis,
         diagnostics: Vec::new(),
         seen: HashSet::new(),
@@ -89,6 +97,7 @@ pub fn analyze_diagnostics(
 
 struct Analyzer<'a> {
     index: &'a WorkspaceIndex,
+    callables: &'a CallableIndex,
     analysis: &'a ModuleAnalysis,
     diagnostics: Vec<OrmDiagnostic>,
     seen: HashSet<(TextRange, String)>,
@@ -108,11 +117,17 @@ impl Analyzer<'_> {
                     imports: scope.imports.clone(),
                     ..Scope::default()
                 };
+                self.bind_function_parameters(function, scope, &mut function_scope);
                 self.analyze_body(&function.body, &mut function_scope);
             }
             Stmt::ClassDef(class) => {
+                let class_instance_state = self.resolve_admin_queryset_state(class, scope);
                 let mut class_scope = Scope {
                     imports: scope.imports.clone(),
+                    class_model: self
+                        .index
+                        .resolve_model_symbol(&self.analysis.module_name, class.name.as_str()),
+                    class_instance_state,
                     ..Scope::default()
                 };
                 self.analyze_body(&class.body, &mut class_scope);
@@ -127,6 +142,14 @@ impl Analyzer<'_> {
                 if let Some(value) = &assign.value {
                     self.analyze_expr(value, scope);
                     self.update_binding(&assign.target, value, scope);
+                }
+                if let Expr::Name(name) = assign.target.as_ref()
+                    && !scope.queries.contains_key(name.id.as_str())
+                    && let Some(model) = self.resolve_annotation_model(&assign.annotation, scope)
+                {
+                    scope
+                        .model_instances
+                        .insert(name.id.to_string(), QueryState::new(model));
                 }
             }
             Stmt::AugAssign(assign) => {
@@ -278,23 +301,39 @@ impl Analyzer<'_> {
         let Some((root, segments)) = attribute_chain(expression) else {
             return false;
         };
+        if segments
+            .last()
+            .is_some_and(|(segment, _)| relation_write_method(segment))
+        {
+            return true;
+        }
         let Some(query) = scope.repeated_items.get(root) else {
             return false;
         };
-        let Some(mut model) = self.index.model(&query.model) else {
+        let Some((relation_path, all_selectable, relation_count)) =
+            self.relation_details(&query.model, segments.iter().map(|(segment, _)| *segment))
+        else {
             return true;
         };
+        let range = segments[relation_count - 1].1;
+        self.emit_missing_eager_load(query, relation_path, all_selectable, range);
+        true
+    }
 
+    fn relation_details<'segment>(
+        &self,
+        model_id: &ModelId,
+        segments: impl IntoIterator<Item = &'segment str>,
+    ) -> Option<(String, bool, usize)> {
+        let mut model = self.index.model(model_id)?;
         let mut relation_path = Vec::new();
         let mut all_selectable = true;
-        let mut diagnostic_range = None;
-        for (segment, range) in segments {
+        for segment in segments {
             let Some(field) = model.relation_for_accessor(segment) else {
                 break;
             };
             relation_path.push(segment);
             all_selectable &= field.supports_select_related();
-            diagnostic_range = Some(range);
             let Some(related_model) = field
                 .related_model
                 .as_ref()
@@ -304,13 +343,21 @@ impl Analyzer<'_> {
             };
             model = related_model;
         }
+        (!relation_path.is_empty()).then(|| {
+            let relation_count = relation_path.len();
+            (relation_path.join("__"), all_selectable, relation_count)
+        })
+    }
 
-        let Some(range) = diagnostic_range else {
-            return true;
-        };
-        let relation_path = relation_path.join("__");
+    fn emit_missing_eager_load(
+        &mut self,
+        query: &QueryState,
+        relation_path: String,
+        all_selectable: bool,
+        range: TextRange,
+    ) {
         if relation_is_loaded(query, &relation_path, all_selectable) {
-            return true;
+            return;
         }
 
         let method = if all_selectable {
@@ -319,8 +366,14 @@ impl Analyzer<'_> {
             "prefetch_related"
         };
         let iteration_range = query.iteration_range.unwrap_or(range);
+        let nested_prefix = format!("{relation_path}__");
+        if self.seen.iter().any(|(seen_iteration, seen_path)| {
+            *seen_iteration == iteration_range && seen_path.starts_with(&nested_prefix)
+        }) {
+            return;
+        }
         if !self.seen.insert((iteration_range, relation_path.clone())) {
-            return true;
+            return;
         }
         self.diagnostics.push(OrmDiagnostic {
             code: MISSING_EAGER_LOAD,
@@ -334,7 +387,72 @@ impl Analyzer<'_> {
             method,
             relation_path,
         });
-        true
+    }
+
+    fn inspect_callable_call(&mut self, call: &ast::ExprCall, scope: &Scope) {
+        let Some((summary, receiver)) = self.resolve_callable_summary(call, scope) else {
+            return;
+        };
+        let summary = summary.clone();
+        for path in &summary.paths {
+            let argument = if path.parameter_index < summary.bound_parameter_count {
+                (path.parameter_index == 0).then_some(receiver).flatten()
+            } else {
+                let positional_index = path.parameter_index - summary.bound_parameter_count;
+                call.arguments.args.get(positional_index).or_else(|| {
+                    let parameter_name = summary.parameters.get(path.parameter_index)?;
+                    call.arguments.keywords.iter().find_map(|keyword| {
+                        (keyword.arg.as_ref()?.as_str() == parameter_name).then_some(&keyword.value)
+                    })
+                })
+            };
+            let Some(argument) = argument else {
+                continue;
+            };
+            let Some((query, mut prefix)) = repeated_expression_origin(argument, scope) else {
+                continue;
+            };
+            prefix.extend(path.segments.iter().map(String::as_str));
+            let Some((relation_path, all_selectable, _)) =
+                self.relation_details(&query.model, prefix)
+            else {
+                continue;
+            };
+            self.emit_missing_eager_load(query, relation_path, all_selectable, argument.range());
+        }
+    }
+
+    fn resolve_callable_summary<'call>(
+        &self,
+        call: &'call ast::ExprCall,
+        scope: &Scope,
+    ) -> Option<(&CallableSummary, Option<&'call Expr>)> {
+        if let Some(qualified) = qualify_expr(
+            &call.func,
+            &self.analysis.module_name,
+            &self.analysis.local_class_names,
+            &scope.imports,
+        ) {
+            if let Some(summary) = self.callables.summary(&qualified) {
+                return Some((summary, None));
+            }
+            if !qualified.contains('.')
+                && let Some(summary) = self
+                    .callables
+                    .summary(&format!("{}.{}", self.analysis.module_name, qualified))
+            {
+                return Some((summary, None));
+            }
+        }
+
+        let Expr::Attribute(method) = call.func.as_ref() else {
+            return None;
+        };
+        let (query, _) = repeated_expression_origin(&method.value, scope)?;
+        let summary = self
+            .callables
+            .summary(&format!("{}.{}", query.model, method.attr))?;
+        Some((summary, Some(&method.value)))
     }
 
     fn update_binding(&self, target: &Expr, value: &Expr, scope: &mut Scope) {
@@ -347,12 +465,14 @@ impl Analyzer<'_> {
             scope.queries.remove(name.id.as_str());
         }
         scope.repeated_items.remove(name.id.as_str());
+        scope.model_instances.remove(name.id.as_str());
     }
 
     fn remove_binding(&self, target: &Expr, scope: &mut Scope) {
         if let Expr::Name(name) = target {
             scope.queries.remove(name.id.as_str());
             scope.repeated_items.remove(name.id.as_str());
+            scope.model_instances.remove(name.id.as_str());
         }
     }
 
@@ -367,6 +487,7 @@ impl Analyzer<'_> {
             return;
         };
         scope.queries.remove(name.id.as_str());
+        scope.model_instances.remove(name.id.as_str());
         if let Some(mut query) = query {
             query.iteration_range = Some(iteration_range);
             scope.repeated_items.insert(name.id.to_string(), query);
@@ -410,12 +531,41 @@ impl Analyzer<'_> {
     fn resolve_query_state(&self, expression: &Expr, scope: &Scope) -> Option<QueryState> {
         match expression {
             Expr::Name(name) => scope.queries.get(name.id.as_str()).cloned(),
+            Expr::Subscript(subscript) if matches!(subscript.slice.as_ref(), Expr::Slice(_)) => {
+                self.resolve_query_state(&subscript.value, scope)
+            }
             Expr::Attribute(attribute) if attribute.attr.as_str() == "objects" => {
                 let model = self.resolve_model_reference(&attribute.value, scope)?;
                 Some(QueryState::new(model))
             }
             Expr::Attribute(_) => self.resolve_related_manager(expression, scope),
             Expr::Call(call) => {
+                if let Expr::Name(function) = call.func.as_ref()
+                    && matches!(
+                        function.id.as_str(),
+                        "list" | "tuple" | "set" | "iter" | "reversed"
+                    )
+                    && call.arguments.args.len() == 1
+                    && call.arguments.keywords.is_empty()
+                {
+                    return self.resolve_query_state(&call.arguments.args[0], scope);
+                }
+                if let Some((summary, _)) = self.resolve_callable_summary(call, scope)
+                    && let Some(return_model) = &summary.return_collection_model
+                    && let Some(model) = self.index.resolve_qualified_model(return_model)
+                {
+                    let mut query = QueryState::new(model);
+                    query
+                        .selected
+                        .extend(summary.return_selected.iter().cloned());
+                    query
+                        .prefetched
+                        .extend(summary.return_prefetched.iter().cloned());
+                    query.select_all = summary.return_select_all;
+                    query.selected_unknown = summary.return_selected_unknown;
+                    query.prefetched_unknown = summary.return_prefetched_unknown;
+                    return Some(query);
+                }
                 let Expr::Attribute(method) = call.func.as_ref() else {
                     return None;
                 };
@@ -467,6 +617,7 @@ impl Analyzer<'_> {
                             .and_then(fetch_mode_from_expression)
                             .unwrap_or(FetchMode::Unknown);
                     }
+                    method if queryset_method_returns_model_instances(method) => {}
                     _ => return None,
                 }
                 Some(query)
@@ -494,8 +645,10 @@ impl Analyzer<'_> {
 
     fn resolve_related_manager(&self, expression: &Expr, scope: &Scope) -> Option<QueryState> {
         let (root, segments) = attribute_chain(expression)?;
-        let repeated = scope.repeated_items.get(root)?;
-        let mut model = self.index.model(&repeated.model)?;
+        let repeated = scope.repeated_items.get(root);
+        let instance = scope.model_instances.get(root);
+        let root_state = repeated.or(instance)?;
+        let mut model = self.index.model(&root_state.model)?;
         let mut relation = None;
         let mut manager_path = Vec::new();
         for (segment, _) in segments {
@@ -510,20 +663,170 @@ impl Analyzer<'_> {
             let mut query = QueryState::new(model.id.clone());
             let prefix = format!("{}__", manager_path.join("__"));
             query.prefetched.extend(
-                repeated
+                root_state
                     .prefetched
                     .iter()
                     .filter_map(|path| path.strip_prefix(&prefix).map(ToOwned::to_owned)),
             );
-            query.prefetched_unknown = repeated.prefetched_unknown;
+            query.prefetched_unknown = root_state.prefetched_unknown;
             query
         })
+    }
+
+    fn bind_function_parameters(
+        &self,
+        function: &ast::StmtFunctionDef,
+        parent_scope: &Scope,
+        function_scope: &mut Scope,
+    ) {
+        for parameter in function.parameters.iter() {
+            if let Some(model) = parameter
+                .annotation()
+                .and_then(|annotation| self.resolve_annotation_model(annotation, parent_scope))
+            {
+                let admin_state = parent_scope
+                    .class_instance_state
+                    .as_ref()
+                    .filter(|state| state.model == model)
+                    .cloned();
+                if let Some(mut state) = admin_state {
+                    state.iteration_range = Some(function.range);
+                    function_scope
+                        .repeated_items
+                        .insert(parameter.name().to_string(), state);
+                } else {
+                    function_scope
+                        .model_instances
+                        .insert(parameter.name().to_string(), QueryState::new(model));
+                }
+            }
+        }
+
+        if let Some(class_model) = &parent_scope.class_model
+            && let Some(parameter) = function.parameters.iter().next()
+            && matches!(parameter.name().as_str(), "self" | "cls")
+        {
+            function_scope.model_instances.insert(
+                parameter.name().to_string(),
+                QueryState::new(class_model.clone()),
+            );
+        }
+    }
+
+    fn resolve_admin_queryset_state(
+        &self,
+        class: &ast::StmtClassDef,
+        scope: &Scope,
+    ) -> Option<QueryState> {
+        let model = class.decorator_list.iter().find_map(|decorator| {
+            let Expr::Call(call) = &decorator.expression else {
+                return None;
+            };
+            let qualified = qualify_expr(
+                &call.func,
+                &self.analysis.module_name,
+                &self.analysis.local_class_names,
+                &scope.imports,
+            )?;
+            if qualified != "django.contrib.admin.register" {
+                return None;
+            }
+            call.arguments
+                .args
+                .first()
+                .and_then(|model| self.resolve_model_reference(model, scope))
+        })?;
+        let get_queryset = class.body.iter().find_map(|statement| match statement {
+            Stmt::FunctionDef(function) if function.name.as_str() == "get_queryset" => {
+                Some(function)
+            }
+            _ => None,
+        });
+        let mut state = QueryState::new(model);
+        if let Some(get_queryset) = get_queryset {
+            let mut visitor = AdminQuerysetVisitor { state: &mut state };
+            for statement in &get_queryset.body {
+                visitor.visit_stmt(statement);
+            }
+        }
+        Some(state)
+    }
+
+    fn resolve_annotation_model(&self, annotation: &Expr, scope: &Scope) -> Option<ModelId> {
+        match annotation {
+            Expr::Name(_) | Expr::Attribute(_) => self.resolve_model_reference(annotation, scope),
+            Expr::BinOp(binary) => {
+                let left = self.resolve_annotation_model(&binary.left, scope);
+                let right = self.resolve_annotation_model(&binary.right, scope);
+                match (left, right) {
+                    (Some(left), Some(right)) if left == right => Some(left),
+                    (Some(model), None) | (None, Some(model)) => Some(model),
+                    _ => None,
+                }
+            }
+            Expr::Subscript(subscript) => {
+                let wrapper = qualify_expr(
+                    &subscript.value,
+                    &self.analysis.module_name,
+                    &self.analysis.local_class_names,
+                    &scope.imports,
+                )?;
+                matches!(
+                    wrapper.rsplit('.').next(),
+                    Some("Optional" | "Union" | "Annotated")
+                )
+                .then(|| self.resolve_annotation_model(&subscript.slice, scope))
+                .flatten()
+            }
+            Expr::Tuple(tuple) => {
+                let mut models = tuple
+                    .elts
+                    .iter()
+                    .filter_map(|item| self.resolve_annotation_model(item, scope));
+                let model = models.next()?;
+                models.all(|candidate| candidate == model).then_some(model)
+            }
+            _ => None,
+        }
     }
 }
 
 struct ExpressionAnalyzer<'a, 'b, 'scope> {
     analyzer: &'a mut Analyzer<'b>,
     scope: &'scope Scope,
+}
+
+struct AdminQuerysetVisitor<'a> {
+    state: &'a mut QueryState,
+}
+
+impl Visitor<'_> for AdminQuerysetVisitor<'_> {
+    fn visit_stmt(&mut self, statement: &Stmt) {
+        if matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+            return;
+        }
+        visitor::walk_stmt(self, statement);
+    }
+
+    fn visit_expr(&mut self, expression: &Expr) {
+        if let Expr::Call(call) = expression
+            && let Expr::Attribute(method) = call.func.as_ref()
+        {
+            let (paths, unknown) = literal_relation_paths(call);
+            match method.attr.as_str() {
+                "select_related" => {
+                    self.state.selected.extend(paths);
+                    self.state.selected_unknown |= unknown;
+                }
+                "prefetch_related" => {
+                    self.state.prefetched.extend(paths);
+                    self.state.prefetched_unknown |= unknown;
+                }
+                _ => {}
+            }
+        }
+        visitor::walk_expr(self, expression);
+    }
 }
 
 impl<'ast> Visitor<'ast> for ExpressionAnalyzer<'_, '_, '_> {
@@ -556,6 +859,19 @@ impl<'ast> Visitor<'ast> for ExpressionAnalyzer<'_, '_, '_> {
                 &[&comprehension.elt],
                 self.scope,
             ),
+            Expr::Call(call) if matches!(call.func.as_ref(), Expr::Attribute(method) if relation_write_method(method.attr.as_str())) =>
+            {
+                for argument in &call.arguments.args {
+                    self.visit_expr(argument);
+                }
+                for keyword in &call.arguments.keywords {
+                    self.visit_expr(&keyword.value);
+                }
+            }
+            Expr::Call(call) => {
+                self.analyzer.inspect_callable_call(call, self.scope);
+                visitor::walk_expr(self, expression);
+            }
             Expr::Attribute(_)
                 if self
                     .analyzer
@@ -579,8 +895,94 @@ fn attribute_chain(expression: &Expr) -> Option<(&str, Vec<(&str, TextRange)>)> 
     Some((root.id.as_str(), segments))
 }
 
+fn repeated_expression_origin<'scope, 'expression>(
+    expression: &'expression Expr,
+    scope: &'scope Scope,
+) -> Option<(&'scope QueryState, Vec<&'expression str>)> {
+    let (root, segments) = attribute_chain(expression)?;
+    Some((
+        scope.repeated_items.get(root)?,
+        segments.into_iter().map(|(segment, _)| segment).collect(),
+    ))
+}
+
 fn literal_relation_paths(call: &ast::ExprCall) -> (Vec<String>, bool) {
     literal_relation_paths_from_arguments(&call.arguments.args, !call.arguments.keywords.is_empty())
+}
+
+fn queryset_method_returns_model_instances(method: &str) -> bool {
+    !matches!(
+        method,
+        "get"
+            | "aget"
+            | "first"
+            | "afirst"
+            | "last"
+            | "alast"
+            | "earliest"
+            | "aearliest"
+            | "latest"
+            | "alatest"
+            | "count"
+            | "acount"
+            | "exists"
+            | "aexists"
+            | "contains"
+            | "acontains"
+            | "aggregate"
+            | "aaggregate"
+            | "create"
+            | "acreate"
+            | "get_or_create"
+            | "aget_or_create"
+            | "update_or_create"
+            | "aupdate_or_create"
+            | "bulk_create"
+            | "abulk_create"
+            | "bulk_update"
+            | "abulk_update"
+            | "update"
+            | "aupdate"
+            | "delete"
+            | "adelete"
+            | "in_bulk"
+            | "ain_bulk"
+            | "values"
+            | "values_list"
+            | "dates"
+            | "datetimes"
+            | "explain"
+            | "aexplain"
+            | "raw"
+    )
+}
+
+fn relation_write_method(method: &str) -> bool {
+    matches!(
+        method,
+        "create"
+            | "acreate"
+            | "get_or_create"
+            | "aget_or_create"
+            | "update_or_create"
+            | "aupdate_or_create"
+            | "add"
+            | "aadd"
+            | "remove"
+            | "aremove"
+            | "clear"
+            | "aclear"
+            | "set"
+            | "aset"
+            | "update"
+            | "aupdate"
+            | "delete"
+            | "adelete"
+            | "bulk_create"
+            | "abulk_create"
+            | "bulk_update"
+            | "abulk_update"
+    )
 }
 
 fn literal_relation_paths_from_arguments(
@@ -659,6 +1061,10 @@ mod tests {
     use crate::config::DjangoLspConfig;
 
     fn diagnostics(source: &str) -> Vec<OrmDiagnostic> {
+        diagnostics_with_modules(source, &[])
+    }
+
+    fn diagnostics_with_modules(source: &str, modules: &[(&str, &str)]) -> Vec<OrmDiagnostic> {
         let directory = tempdir().unwrap();
         let app = directory.path().join("blog");
         fs::create_dir_all(&app).unwrap();
@@ -680,9 +1086,28 @@ class Blog(models.Model):
     title = models.CharField()
     author = models.ForeignKey(Author, on_delete=models.CASCADE, related_name="blogs")
     tags = models.ManyToManyField(Tag)
+
+class Conference(models.Model):
+    name = models.CharField()
+
+class ReviewSession(models.Model):
+    conference = models.ForeignKey(Conference, on_delete=models.CASCADE)
+
+class Grant(models.Model):
+    conference = models.ForeignKey(Conference, on_delete=models.CASCADE, related_name="grants")
+
+class ReimbursementCategory(models.Model):
+    name = models.CharField()
+
+class Reimbursement(models.Model):
+    grant = models.ForeignKey(Grant, on_delete=models.CASCADE, related_name="reimbursements")
+    category = models.ForeignKey(ReimbursementCategory, on_delete=models.CASCADE)
 "#,
         )
         .unwrap();
+        for (name, source) in modules {
+            fs::write(app.join(name), source).unwrap();
+        }
         let views = app.join("views.py");
         fs::write(&views, source).unwrap();
         let database =
@@ -836,6 +1261,241 @@ def dotted_import():
         );
 
         assert_eq!(result.len(), 2, "{result:#?}");
+    }
+
+    #[test]
+    fn follows_typed_model_parameters_related_managers_and_collection_wrappers() {
+        let result = diagnostics(
+            r#"
+from .models import ReviewSession
+
+def notify_grants(review_session: ReviewSession):
+    grants = list(review_session.conference.grants.filter(active=True))
+    for grant in grants:
+        if grant.reimbursements.exists():
+            for reimbursement in grant.reimbursements.all():
+                print(reimbursement.category.name)
+"#,
+        );
+
+        assert_eq!(result.len(), 2, "{result:#?}");
+        assert_eq!(result[0].relation_path, "reimbursements");
+        assert_eq!(result[0].method, "prefetch_related");
+        assert_eq!(result[1].relation_path, "category");
+        assert_eq!(result[1].method, "select_related");
+    }
+
+    #[test]
+    fn follows_related_managers_from_django_model_self() {
+        let result = diagnostics(
+            r#"
+from django.db import models
+from .models import Team
+
+class Parent(models.Model):
+    def child_names(self):
+        return [child.team.name for child in self.children.all()]
+
+class Child(models.Model):
+    parent = models.ForeignKey(Parent, on_delete=models.CASCADE, related_name="children")
+    team = models.ForeignKey(Team, on_delete=models.CASCADE)
+"#,
+        );
+
+        assert_eq!(result.len(), 1, "{result:#?}");
+        assert_eq!(result[0].relation_path, "team");
+    }
+
+    #[test]
+    fn follows_custom_queryset_methods_but_not_terminal_projection_methods() {
+        let result = diagnostics(
+            r#"
+from .models import Blog
+
+for blog in Blog.objects.published().for_homepage():
+    print(blog.author.name)
+
+for row in Blog.objects.values("author"):
+    print(row.author.name)
+"#,
+        );
+
+        assert_eq!(result.len(), 1, "{result:#?}");
+        assert_eq!(result[0].relation_path, "author");
+    }
+
+    #[test]
+    fn follows_cross_module_and_transitive_helper_calls() {
+        let result = diagnostics_with_modules(
+            r#"
+from .models import Blog
+from .presenters import Card
+
+for blog in Blog.objects.all():
+    print(Card.from_model(blog))
+"#,
+            &[(
+                "presenters.py",
+                r#"
+def author_name(blog):
+    return blog.author.name
+
+def render_blog(blog):
+    return author_name(blog)
+
+class Card:
+    @classmethod
+    def from_model(cls, blog):
+        return render_blog(blog)
+"#,
+            )],
+        );
+
+        assert_eq!(result.len(), 1, "{result:#?}");
+        assert_eq!(result[0].relation_path, "author");
+        assert_eq!(result[0].method, "select_related");
+    }
+
+    #[test]
+    fn follows_django_model_instance_method_calls() {
+        let result = diagnostics(
+            r#"
+from django.db import models
+from .models import Author
+
+class Article(models.Model):
+    author = models.ForeignKey(Author, on_delete=models.CASCADE)
+
+    def byline(self):
+        return self.author.team.name
+
+    def label(self):
+        return self.byline()
+
+for article in Article.objects.all():
+    print(article.label())
+"#,
+        );
+
+        assert_eq!(result.len(), 1, "{result:#?}");
+        assert_eq!(result[0].relation_path, "author__team");
+    }
+
+    #[test]
+    fn helper_call_paths_compose_with_related_arguments() {
+        let result = diagnostics(
+            r#"
+from .models import Blog
+
+def team_name(author):
+    return author.team.name
+
+for blog in Blog.objects.all():
+    print(team_name(blog.author))
+"#,
+        );
+
+        assert_eq!(result.len(), 1, "{result:#?}");
+        assert_eq!(result[0].relation_path, "author__team");
+    }
+
+    #[test]
+    fn helper_summaries_respect_internal_prefetches_and_relation_writes() {
+        let result = diagnostics(
+            r#"
+from django.db.models import prefetch_related_objects
+from .models import Blog
+
+FIELDS = ("author",)
+
+def render_blog(blog):
+    prefetch_related_objects([blog], *FIELDS)
+    return blog.author.name
+
+def attach_tag(blog, tag):
+    blog.tags.add(tag)
+    blog.tags.all().delete()
+
+for blog in Blog.objects.all():
+    print(render_blog(blog))
+    attach_tag(blog, object())
+    blog.tags.clear()
+    blog.tags.all().delete()
+"#,
+        );
+
+        assert!(result.is_empty(), "{result:#?}");
+    }
+
+    #[test]
+    fn django_admin_display_methods_inherit_get_queryset_eager_loading() {
+        let result = diagnostics(
+            r#"
+from django.contrib import admin
+from .models import Grant
+
+@admin.register(Grant)
+class GrantAdmin(admin.ModelAdmin):
+    @admin.display
+    def reimbursements(self, obj: Grant):
+        return [item.category.name for item in obj.reimbursements.all()]
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).prefetch_related("reimbursements__category")
+"#,
+        );
+
+        assert!(result.is_empty(), "{result:#?}");
+    }
+
+    #[test]
+    fn django_admin_display_methods_warn_when_get_queryset_does_not_load_relation() {
+        let result = diagnostics(
+            r#"
+from django.contrib import admin
+from .models import Blog
+
+@admin.register(Blog)
+class BlogAdmin(admin.ModelAdmin):
+    @admin.display
+    def author_name(self, obj: Blog):
+        return obj.author.name
+
+    def get_queryset(self, request):
+        return super().get_queryset(request)
+"#,
+        );
+
+        assert_eq!(result.len(), 1, "{result:#?}");
+        assert_eq!(result[0].relation_path, "author");
+    }
+
+    #[test]
+    fn follows_queryset_return_annotations_without_guessing_collection_inputs() {
+        let result = diagnostics(
+            r#"
+from django.db.models import QuerySet
+from .models import Blog
+
+def render_blogs(blogs: list[Blog]):
+    return [blog.author.name for blog in blogs]
+
+def published_blogs() -> QuerySet[Blog]:
+    return Blog.objects.filter(published=True)
+
+for blog in published_blogs()[:10]:
+    print(blog.author.name)
+
+def ready_blogs() -> QuerySet[Blog]:
+    return Blog.objects.select_related("author")
+
+for blog in ready_blogs():
+    print(blog.author.name)
+"#,
+        );
+
+        assert_eq!(result.len(), 1, "{result:#?}");
+        assert_eq!(result[0].relation_path, "author");
     }
 
     #[test]

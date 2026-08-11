@@ -13,7 +13,8 @@ use crate::config::DjangoLspConfig;
 use crate::diagnostic::{OrmDiagnostic, analyze_diagnostics};
 use crate::error::{DjangoLspError, Result};
 use crate::index::{
-    ModuleAnalysis, ModuleFacts, WorkspaceIndex, analyze_source, facts_from_analysis,
+    CallableFacts, CallableIndex, ModuleAnalysis, ModuleFacts, WorkspaceIndex, analyze_source,
+    callable_facts_from_analysis, facts_from_analysis,
 };
 
 const DEFAULT_EXCLUDES: &[&str] = &[
@@ -66,6 +67,11 @@ fn module_facts(db: &dyn Db, project: Project, file: SourceFile) -> ModuleFacts 
 }
 
 #[salsa::tracked(returns(ref))]
+fn callable_facts(db: &dyn Db, project: Project, file: SourceFile) -> CallableFacts {
+    callable_facts_from_analysis(parsed_module(db, project, file))
+}
+
+#[salsa::tracked(returns(ref))]
 fn project_index(db: &dyn Db, project: Project) -> WorkspaceIndex {
     let facts = project
         .files(db)
@@ -80,8 +86,22 @@ fn project_index(db: &dyn Db, project: Project) -> WorkspaceIndex {
 }
 
 #[salsa::tracked(returns(ref))]
+fn project_callable_index(db: &dyn Db, project: Project) -> CallableIndex {
+    let facts = project
+        .files(db)
+        .iter()
+        .map(|file| callable_facts(db, project, *file))
+        .collect::<Vec<_>>();
+    CallableIndex::from_facts(&facts)
+}
+
+#[salsa::tracked(returns(ref))]
 fn file_diagnostics(db: &dyn Db, project: Project, file: SourceFile) -> Vec<OrmDiagnostic> {
-    analyze_diagnostics(project_index(db, project), parsed_module(db, project, file))
+    analyze_diagnostics(
+        project_index(db, project),
+        project_callable_index(db, project),
+        parsed_module(db, project, file),
+    )
 }
 
 /// Incremental database shared by editor features and future command-line diagnostics.

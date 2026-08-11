@@ -3,6 +3,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use ruff_python_ast as ast;
+use ruff_python_ast::visitor::{self, Visitor};
 use ruff_python_ast::{Expr, PySourceType, Stmt};
 use ruff_python_parser::parse_unchecked_source;
 use ruff_text_size::{Ranged, TextSize};
@@ -177,6 +178,77 @@ pub(crate) struct ModuleFacts {
     local_class_names: HashSet<String>,
     raw_classes: Vec<RawClassInfo>,
     settings: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CallablePath {
+    pub parameter_index: usize,
+    pub segments: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallableSummary {
+    pub qualified_name: String,
+    pub parameters: Vec<String>,
+    pub bound_parameter_count: usize,
+    pub paths: Vec<CallablePath>,
+    pub return_collection_model: Option<String>,
+    pub return_selected: Vec<String>,
+    pub return_prefetched: Vec<String>,
+    pub return_select_all: bool,
+    pub return_selected_unknown: bool,
+    pub return_prefetched_unknown: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CallableFacts {
+    summaries: Vec<RawCallableSummary>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CallableIndex {
+    summaries: HashMap<String, CallableSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawCallableSummary {
+    qualified_name: String,
+    parameters: Vec<String>,
+    bound_parameter_count: usize,
+    return_collection_model: Option<String>,
+    return_loading: QueryLoadingState,
+    paths: Vec<CallablePath>,
+    calls: Vec<SummaryCall>,
+    prefetches: HashMap<usize, SummaryPrefetchState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SummaryCall {
+    target: String,
+    receiver: Option<ParameterOrigin>,
+    positional: Vec<Option<ParameterOrigin>>,
+    keywords: Vec<(String, ParameterOrigin)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParameterOrigin {
+    parameter_index: usize,
+    prefix: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SummaryPrefetchState {
+    paths: HashSet<String>,
+    unknown: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct QueryLoadingState {
+    selected: HashSet<String>,
+    prefetched: HashSet<String>,
+    select_all: bool,
+    selected_unknown: bool,
+    prefetched_unknown: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -484,6 +556,139 @@ impl WorkspaceIndex {
     }
 }
 
+impl CallableIndex {
+    pub(crate) fn from_facts(facts: &[&CallableFacts]) -> Self {
+        const MAX_SUMMARY_DEPTH: usize = 8;
+
+        let raw = facts
+            .iter()
+            .flat_map(|facts| facts.summaries.iter().cloned())
+            .map(|summary| (summary.qualified_name.clone(), summary))
+            .collect::<HashMap<_, _>>();
+        let mut paths = raw
+            .iter()
+            .map(|(name, summary)| {
+                (
+                    name.clone(),
+                    summary.paths.iter().cloned().collect::<HashSet<_>>(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        for _ in 0..MAX_SUMMARY_DEPTH {
+            let snapshot = paths.clone();
+            let mut changed = false;
+            for (caller_name, caller) in &raw {
+                let Some(caller_paths) = paths.get_mut(caller_name) else {
+                    continue;
+                };
+                for call in &caller.calls {
+                    let Some(callee) = raw.get(&call.target) else {
+                        continue;
+                    };
+                    let Some(callee_paths) = snapshot.get(&call.target) else {
+                        continue;
+                    };
+                    for callee_path in callee_paths {
+                        let Some(origin) =
+                            call.parameter_origin(callee, callee_path.parameter_index)
+                        else {
+                            continue;
+                        };
+                        let mut segments = origin.prefix.clone();
+                        segments.extend(callee_path.segments.iter().cloned());
+                        if segments.is_empty() || segments.len() > MAX_SUMMARY_DEPTH {
+                            continue;
+                        }
+                        if caller.prefetch_covers(origin.parameter_index, &segments) {
+                            continue;
+                        }
+                        changed |= caller_paths.insert(CallablePath {
+                            parameter_index: origin.parameter_index,
+                            segments,
+                        });
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let summaries = raw
+            .into_iter()
+            .map(|(name, raw)| {
+                let mut summary_paths = paths
+                    .remove(&name)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                summary_paths.sort();
+                (
+                    name.clone(),
+                    CallableSummary {
+                        qualified_name: name,
+                        parameters: raw.parameters,
+                        bound_parameter_count: raw.bound_parameter_count,
+                        paths: summary_paths,
+                        return_collection_model: raw.return_collection_model,
+                        return_selected: sorted_strings(raw.return_loading.selected),
+                        return_prefetched: sorted_strings(raw.return_loading.prefetched),
+                        return_select_all: raw.return_loading.select_all,
+                        return_selected_unknown: raw.return_loading.selected_unknown,
+                        return_prefetched_unknown: raw.return_loading.prefetched_unknown,
+                    },
+                )
+            })
+            .collect();
+        Self { summaries }
+    }
+
+    pub fn summary(&self, qualified_name: &str) -> Option<&CallableSummary> {
+        self.summaries.get(qualified_name)
+    }
+}
+
+impl RawCallableSummary {
+    fn prefetch_covers(&self, parameter_index: usize, segments: &[String]) -> bool {
+        let Some(prefetch) = self.prefetches.get(&parameter_index) else {
+            return false;
+        };
+        if prefetch.unknown {
+            return true;
+        }
+        let path = segments.join("__");
+        prefetch
+            .paths
+            .iter()
+            .any(|loaded| path == *loaded || path.starts_with(&format!("{loaded}__")))
+    }
+}
+
+impl SummaryCall {
+    fn parameter_origin(
+        &self,
+        callee: &RawCallableSummary,
+        parameter_index: usize,
+    ) -> Option<&ParameterOrigin> {
+        if parameter_index < callee.bound_parameter_count {
+            return (parameter_index == 0)
+                .then_some(self.receiver.as_ref())
+                .flatten();
+        }
+        let positional_index = parameter_index.checked_sub(callee.bound_parameter_count)?;
+        self.positional
+            .get(positional_index)
+            .and_then(Option::as_ref)
+            .or_else(|| {
+                let parameter_name = callee.parameters.get(parameter_index)?;
+                self.keywords
+                    .iter()
+                    .find_map(|(name, origin)| (name == parameter_name).then_some(origin))
+            })
+    }
+}
+
 pub fn analyze_source(root: &Path, path: &Path, source: &str) -> ModuleAnalysis {
     let parsed = parse_unchecked_source(source, PySourceType::from(path));
     let syntax = parsed.syntax().clone();
@@ -519,6 +724,509 @@ pub(crate) fn facts_from_analysis(analysis: &ModuleAnalysis) -> ModuleFacts {
         raw_classes: extract_raw_classes(analysis),
         settings: extract_settings_assignments(&analysis.body),
     }
+}
+
+pub(crate) fn callable_facts_from_analysis(analysis: &ModuleAnalysis) -> CallableFacts {
+    let local_functions = analysis
+        .body
+        .iter()
+        .filter_map(|statement| match statement {
+            Stmt::FunctionDef(function) => Some(function.name.id.to_string()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut summaries = Vec::new();
+    for statement in &analysis.body {
+        match statement {
+            Stmt::FunctionDef(function) => summaries.push(extract_callable_summary(
+                analysis,
+                &local_functions,
+                None,
+                function,
+            )),
+            Stmt::ClassDef(class) => {
+                for statement in &class.body {
+                    if let Stmt::FunctionDef(function) = statement {
+                        summaries.push(extract_callable_summary(
+                            analysis,
+                            &local_functions,
+                            Some(class.name.as_str()),
+                            function,
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    CallableFacts { summaries }
+}
+
+fn extract_callable_summary(
+    analysis: &ModuleAnalysis,
+    local_functions: &HashSet<String>,
+    class_name: Option<&str>,
+    function: &ast::StmtFunctionDef,
+) -> RawCallableSummary {
+    let parameters = function
+        .parameters
+        .iter()
+        .map(|parameter| parameter.name().to_string())
+        .collect::<Vec<_>>();
+    let parameter_indices = parameters
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.clone(), index))
+        .collect();
+    let bound_parameter_count = usize::from(
+        class_name.is_some()
+            && !function.decorator_list.iter().any(|decorator| {
+                qualify_expr(
+                    &decorator.expression,
+                    &analysis.module_name,
+                    &analysis.local_class_names,
+                    &analysis.imports,
+                )
+                .is_some_and(|name| name.rsplit('.').next() == Some("staticmethod"))
+            }),
+    );
+    let mut visitor = CallableSummaryVisitor {
+        module_name: &analysis.module_name,
+        class_name,
+        local_class_names: &analysis.local_class_names,
+        imports: &analysis.imports,
+        local_functions,
+        parameter_indices,
+        paths: HashSet::new(),
+        calls: Vec::new(),
+        prefetches: HashMap::new(),
+    };
+    for statement in &function.body {
+        visitor.visit_stmt(statement);
+    }
+    let mut paths = visitor
+        .paths
+        .into_iter()
+        .filter(|path| {
+            let Some(prefetch) = visitor.prefetches.get(&path.parameter_index) else {
+                return true;
+            };
+            if prefetch.unknown {
+                return false;
+            }
+            let path = path.segments.join("__");
+            !prefetch
+                .paths
+                .iter()
+                .any(|loaded| path == *loaded || path.starts_with(&format!("{loaded}__")))
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    let qualified_name = class_name.map_or_else(
+        || format!("{}.{}", analysis.module_name, function.name.id),
+        |class_name| format!("{}.{class_name}.{}", analysis.module_name, function.name.id),
+    );
+    RawCallableSummary {
+        qualified_name,
+        parameters,
+        bound_parameter_count,
+        return_collection_model: function
+            .returns
+            .as_deref()
+            .and_then(|annotation| collection_annotation_model_name(annotation, analysis)),
+        return_loading: return_query_loading(function),
+        paths,
+        calls: visitor.calls,
+        prefetches: visitor.prefetches,
+    }
+}
+
+fn collection_annotation_model_name(
+    annotation: &Expr,
+    analysis: &ModuleAnalysis,
+) -> Option<String> {
+    match annotation {
+        Expr::BinOp(binary) => collection_annotation_model_name(&binary.left, analysis)
+            .or_else(|| collection_annotation_model_name(&binary.right, analysis)),
+        Expr::Subscript(subscript) => {
+            let wrapper = qualify_expr(
+                &subscript.value,
+                &analysis.module_name,
+                &analysis.local_class_names,
+                &analysis.imports,
+            )?;
+            let wrapper = wrapper.rsplit('.').next()?;
+            if matches!(wrapper, "Optional" | "Union" | "Annotated") {
+                return collection_annotation_model_name(&subscript.slice, analysis);
+            }
+            if !matches!(wrapper, "QuerySet" | "Manager" | "BaseManager") {
+                return None;
+            }
+            let item = match subscript.slice.as_ref() {
+                Expr::Tuple(tuple) => tuple.elts.first()?,
+                item => item,
+            };
+            qualify_expr(
+                item,
+                &analysis.module_name,
+                &analysis.local_class_names,
+                &analysis.imports,
+            )
+        }
+        Expr::Tuple(tuple) => tuple
+            .elts
+            .iter()
+            .find_map(|item| collection_annotation_model_name(item, analysis)),
+        _ => None,
+    }
+}
+
+fn return_query_loading(function: &ast::StmtFunctionDef) -> QueryLoadingState {
+    let mut collector = ReturnQueryLoadingCollector { states: Vec::new() };
+    for statement in &function.body {
+        collector.visit_stmt(statement);
+    }
+    let mut states = collector.states.into_iter();
+    let Some(mut merged) = states.next() else {
+        return QueryLoadingState::default();
+    };
+    for state in states {
+        match (merged.select_all, state.select_all) {
+            (true, false) => {
+                merged.selected = state.selected;
+                merged.select_all = false;
+            }
+            (false, false) => merged.selected.retain(|path| state.selected.contains(path)),
+            _ => {}
+        }
+        merged
+            .prefetched
+            .retain(|path| state.prefetched.contains(path));
+        merged.selected_unknown |= state.selected_unknown;
+        merged.prefetched_unknown |= state.prefetched_unknown;
+    }
+    merged
+}
+
+struct ReturnQueryLoadingCollector {
+    states: Vec<QueryLoadingState>,
+}
+
+impl Visitor<'_> for ReturnQueryLoadingCollector {
+    fn visit_stmt(&mut self, statement: &Stmt) {
+        match statement {
+            Stmt::Return(return_statement) => {
+                let mut state = QueryLoadingState::default();
+                if let Some(value) = &return_statement.value {
+                    QueryLoadingVisitor { state: &mut state }.visit_expr(value);
+                }
+                self.states.push(state);
+            }
+            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+            _ => visitor::walk_stmt(self, statement),
+        }
+    }
+}
+
+struct QueryLoadingVisitor<'a> {
+    state: &'a mut QueryLoadingState,
+}
+
+impl Visitor<'_> for QueryLoadingVisitor<'_> {
+    fn visit_expr(&mut self, expression: &Expr) {
+        if let Expr::Call(call) = expression
+            && let Expr::Attribute(method) = call.func.as_ref()
+        {
+            match method.attr.as_str() {
+                "select_related" => {
+                    if call.arguments.args.is_empty() {
+                        self.state.select_all = true;
+                    } else if call
+                        .arguments
+                        .args
+                        .first()
+                        .is_some_and(|argument| matches!(argument, Expr::NoneLiteral(_)))
+                    {
+                        self.state.selected.clear();
+                        self.state.select_all = false;
+                        self.state.selected_unknown = false;
+                    } else {
+                        let (paths, unknown) = query_loading_paths(call);
+                        self.state.selected.extend(paths);
+                        self.state.selected_unknown |= unknown;
+                    }
+                }
+                "prefetch_related" => {
+                    if call.arguments.args.len() == 1
+                        && call
+                            .arguments
+                            .args
+                            .first()
+                            .is_some_and(|argument| matches!(argument, Expr::NoneLiteral(_)))
+                    {
+                        self.state.prefetched.clear();
+                        self.state.prefetched_unknown = false;
+                    } else {
+                        let (paths, unknown) = query_loading_paths(call);
+                        self.state.prefetched.extend(paths);
+                        self.state.prefetched_unknown |= unknown;
+                    }
+                }
+                _ => {}
+            }
+        }
+        visitor::walk_expr(self, expression);
+    }
+}
+
+fn query_loading_paths(call: &ast::ExprCall) -> (Vec<String>, bool) {
+    let mut unknown = !call.arguments.keywords.is_empty();
+    let paths = call
+        .arguments
+        .args
+        .iter()
+        .filter_map(|argument| {
+            let path = match argument {
+                Expr::StringLiteral(literal) => Some(literal.value.to_str().to_string()),
+                Expr::Call(prefetch) => {
+                    let is_prefetch = match prefetch.func.as_ref() {
+                        Expr::Name(name) => name.id.as_str() == "Prefetch",
+                        Expr::Attribute(attribute) => attribute.attr.as_str() == "Prefetch",
+                        _ => false,
+                    };
+                    is_prefetch
+                        .then(|| prefetch.arguments.args.first())
+                        .flatten()
+                        .and_then(|argument| match argument {
+                            Expr::StringLiteral(literal) => {
+                                Some(literal.value.to_str().to_string())
+                            }
+                            _ => None,
+                        })
+                }
+                _ => None,
+            };
+            unknown |= path.is_none();
+            path
+        })
+        .collect();
+    (paths, unknown)
+}
+
+fn sorted_strings(values: HashSet<String>) -> Vec<String> {
+    let mut values = values.into_iter().collect::<Vec<_>>();
+    values.sort();
+    values
+}
+
+struct CallableSummaryVisitor<'a> {
+    module_name: &'a str,
+    class_name: Option<&'a str>,
+    local_class_names: &'a HashSet<String>,
+    imports: &'a HashMap<String, String>,
+    local_functions: &'a HashSet<String>,
+    parameter_indices: HashMap<String, usize>,
+    paths: HashSet<CallablePath>,
+    calls: Vec<SummaryCall>,
+    prefetches: HashMap<usize, SummaryPrefetchState>,
+}
+
+impl Visitor<'_> for CallableSummaryVisitor<'_> {
+    fn visit_stmt(&mut self, statement: &Stmt) {
+        if matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+            return;
+        }
+        visitor::walk_stmt(self, statement);
+    }
+
+    fn visit_expr(&mut self, expression: &Expr) {
+        if let Expr::Call(call) = expression
+            && let Expr::Attribute(method) = call.func.as_ref()
+            && relation_write_method(method.attr.as_str())
+        {
+            for argument in &call.arguments.args {
+                self.visit_expr(argument);
+            }
+            for keyword in &call.arguments.keywords {
+                self.visit_expr(&keyword.value);
+            }
+            return;
+        }
+        if let Some(origin) = parameter_origin(expression, &self.parameter_indices)
+            && !origin.prefix.is_empty()
+        {
+            if origin
+                .prefix
+                .last()
+                .is_some_and(|segment| relation_write_method(segment))
+            {
+                return;
+            }
+            self.paths.insert(CallablePath {
+                parameter_index: origin.parameter_index,
+                segments: origin.prefix,
+            });
+            return;
+        }
+
+        if let Expr::Call(call) = expression {
+            self.record_prefetch_related_objects(call);
+            let receiver = match call.func.as_ref() {
+                Expr::Attribute(method) => parameter_origin(&method.value, &self.parameter_indices),
+                _ => None,
+            };
+            let same_class_target = match (call.func.as_ref(), self.class_name) {
+                (Expr::Attribute(method), Some(class_name)) if matches!(method.value.as_ref(), Expr::Name(name) if matches!(name.id.as_str(), "self" | "cls")) => {
+                    Some(format!("{}.{class_name}.{}", self.module_name, method.attr))
+                }
+                _ => None,
+            };
+            let target = same_class_target.or_else(|| {
+                qualify_expr(
+                    &call.func,
+                    self.module_name,
+                    self.local_class_names,
+                    self.imports,
+                )
+                .map(|target| {
+                    if !target.contains('.') && self.local_functions.contains(&target) {
+                        format!("{}.{}", self.module_name, target)
+                    } else {
+                        target
+                    }
+                })
+            });
+            if let Some(target) = target {
+                let positional = call
+                    .arguments
+                    .args
+                    .iter()
+                    .map(|argument| parameter_origin(argument, &self.parameter_indices))
+                    .collect();
+                let keywords = call
+                    .arguments
+                    .keywords
+                    .iter()
+                    .filter_map(|keyword| {
+                        Some((
+                            keyword.arg.as_ref()?.to_string(),
+                            parameter_origin(&keyword.value, &self.parameter_indices)?,
+                        ))
+                    })
+                    .collect();
+                self.calls.push(SummaryCall {
+                    target,
+                    receiver,
+                    positional,
+                    keywords,
+                });
+            }
+        }
+
+        visitor::walk_expr(self, expression);
+    }
+}
+
+impl CallableSummaryVisitor<'_> {
+    fn record_prefetch_related_objects(&mut self, call: &ast::ExprCall) {
+        let Some(target) = qualify_expr(
+            &call.func,
+            self.module_name,
+            self.local_class_names,
+            self.imports,
+        ) else {
+            return;
+        };
+        if !matches!(
+            target.as_str(),
+            "django.db.models.prefetch_related_objects"
+                | "django.db.models.query.prefetch_related_objects"
+        ) {
+            return;
+        }
+        let Some(objects) = call.arguments.args.first() else {
+            return;
+        };
+        let object_expressions: &[Expr] = match objects {
+            Expr::List(list) => &list.elts,
+            Expr::Tuple(tuple) => &tuple.elts,
+            Expr::Set(set) => &set.elts,
+            expression => std::slice::from_ref(expression),
+        };
+        let parameter_indices = object_expressions
+            .iter()
+            .filter_map(|expression| {
+                let origin = parameter_origin(expression, &self.parameter_indices)?;
+                origin.prefix.is_empty().then_some(origin.parameter_index)
+            })
+            .collect::<Vec<_>>();
+        if parameter_indices.is_empty() {
+            return;
+        }
+
+        let mut paths = Vec::new();
+        let mut unknown = !call.arguments.keywords.is_empty();
+        for argument in call.arguments.args.iter().skip(1) {
+            if let Expr::StringLiteral(literal) = argument {
+                paths.push(literal.value.to_str().to_string());
+            } else {
+                unknown = true;
+            }
+        }
+        for parameter_index in parameter_indices {
+            let state = self.prefetches.entry(parameter_index).or_default();
+            state.paths.extend(paths.iter().cloned());
+            state.unknown |= unknown;
+        }
+    }
+}
+
+fn parameter_origin(
+    expression: &Expr,
+    parameter_indices: &HashMap<String, usize>,
+) -> Option<ParameterOrigin> {
+    let mut current = expression;
+    let mut prefix = Vec::new();
+    while let Expr::Attribute(attribute) = current {
+        prefix.push(attribute.attr.to_string());
+        current = &attribute.value;
+    }
+    let Expr::Name(root) = current else {
+        return None;
+    };
+    prefix.reverse();
+    Some(ParameterOrigin {
+        parameter_index: *parameter_indices.get(root.id.as_str())?,
+        prefix,
+    })
+}
+
+fn relation_write_method(method: &str) -> bool {
+    matches!(
+        method,
+        "create"
+            | "acreate"
+            | "get_or_create"
+            | "aget_or_create"
+            | "update_or_create"
+            | "aupdate_or_create"
+            | "add"
+            | "aadd"
+            | "remove"
+            | "aremove"
+            | "clear"
+            | "aclear"
+            | "set"
+            | "aset"
+            | "update"
+            | "aupdate"
+            | "delete"
+            | "adelete"
+            | "bulk_create"
+            | "abulk_create"
+            | "bulk_update"
+            | "abulk_update"
+    )
 }
 
 fn module_name_from_path(root: &Path, path: &Path) -> String {

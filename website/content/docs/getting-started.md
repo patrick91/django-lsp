@@ -137,10 +137,22 @@ for blog in Blog.objects.select_related("author"):
     print(blog.author.email)
 ```
 
-The same analysis covers list, set, dictionary, and generator comprehensions. Reverse and
-many-to-many access recommends `prefetch_related()` instead. On Django 6.1, `FETCH_PEERS` and
-`RAISE` fetch modes are also understood for single-valued relations. Standalone
-`prefetch_related_objects()` calls are tracked too, including literal `Prefetch` objects.
+The same analysis covers list, set, dictionary, and generator comprehensions; QuerySets collected
+with `list()`, `tuple()`, or `set()`; custom QuerySet methods; typed model parameters; and typed
+QuerySet return values. A collection parameter alone is not treated as a database query because its
+caller may already have loaded the relation. Reverse and many-to-many access recommends
+`prefetch_related()` instead.
+
+Relation access can live in a helper rather than directly in the loop. django-lsp builds bounded,
+cross-module summaries for regular functions, instance methods, classmethods, and transitive helper
+calls, so a call such as `BlogCard.from_model(blog)` is checked against the QuerySet that produced
+`blog`. Eager loading performed inside the helper is respected, as is eager loading declared by a
+Django `ModelAdmin.get_queryset()` for its display methods.
+
+On Django 6.1, `FETCH_PEERS` and `RAISE` fetch modes are understood for single-valued relations.
+Standalone `prefetch_related_objects()` calls are tracked too, including literal `Prefetch`
+objects. Dynamic dispatch and relation paths hidden behind reassigned local aliases are intentionally
+outside the current bounded call analysis.
 
 Run the exact same analysis without an editor from the project root:
 

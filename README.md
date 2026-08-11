@@ -80,8 +80,12 @@ bun run serve
 - workspace model indexing
 - completion inside `filter(...)`, `exclude(...)`, `get(...)`, `select_related(...)`, and
   `prefetch_related(...)`
-- `DJ001` warnings for missing `select_related()` or `prefetch_related()` in QuerySet loops and
-  comprehensions, available through both the LSP and `django-lsp check`
+- `DJ001` warnings for missing `select_related()` or `prefetch_related()` across QuerySet loops,
+  comprehensions, collected QuerySets, related managers, and helper calls, available through both
+  the LSP and `django-lsp check`
+- bounded cross-module call summaries, custom QuerySet chains, collection wrappers, typed model
+  parameters, and typed QuerySet-returning functions
+- Django admin display-method awareness, including eager loading declared by `get_queryset()`
 - Django 6.1 `FETCH_PEERS` and `RAISE` fetch-mode awareness for single-valued relations
 - forward, reverse, and recursive relation traversal
 - `AUTH_USER_MODEL` support
