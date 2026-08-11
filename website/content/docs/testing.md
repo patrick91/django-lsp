@@ -18,8 +18,9 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
 ```
 
-Unit tests cover indexing, import resolution, relation traversal, completion ranking, configuration,
-and LSP position conversion.
+Unit tests cover indexing, import resolution, relation traversal, completion ranking, repeated-query
+analysis, configuration, and LSP position conversion. `tests/cli_check.rs` verifies the checker's
+human-readable output and exit statuses.
 
 ## Protocol tests
 
@@ -28,7 +29,7 @@ and LSP position conversion.
 - an in-process JSON-RPC service covering initialization, document open/change/close events,
   completion requests, and unsaved model changes
 - the compiled `django-lsp` executable using real `Content-Length` framing over standard input and
-  output
+  output, including editor-visible `publishDiagnostics` notifications
 
 Run only this layer with:
 
@@ -52,7 +53,7 @@ Set `DJANGO_LSP_BENCHMARK_DOCUMENT` when the representative document is somewher
 `$DJANGO_LSP_BENCHMARK_ROOT/manage.py`. Run the benchmark several times so the first cold filesystem
 scan remains distinguishable from warm runs.
 
-## Executable completion examples
+## Executable documentation examples
 
 The human-facing [completion examples](/docs/completions/) contain hidden scenario directives next to
 their visible generated output. Each directive contains normal Python plus one `<cursor>` marker:
@@ -90,6 +91,11 @@ cargo run --bin render-docs -- --check
 ```
 
 `tests/markdown_docs.rs` runs the check as part of `cargo test --all-targets`.
+
+Diagnostic examples use a `django-lsp-diagnostic` directive around a visible Python fence. The
+renderer replaces that fence in the Django fixture's unsaved buffer and verifies the declared code,
+eager-loading method, and relation path against the real Salsa analysis database. This keeps the
+warning shown in [getting started](/docs/) executable without generating a second copy of it.
 
 ## Documentation website
 

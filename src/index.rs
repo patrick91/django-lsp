@@ -1,31 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
-use ignore::WalkBuilder;
 use ruff_python_ast as ast;
 use ruff_python_ast::{Expr, PySourceType, Stmt};
 use ruff_python_parser::parse_unchecked_source;
 use ruff_text_size::{Ranged, TextSize};
 
 use crate::config::DjangoLspConfig;
-use crate::document_store::DocumentStore;
-use crate::error::{DjangoLspError, Result};
-
-const DEFAULT_EXCLUDES: &[&str] = &[
-    "**/.git/**",
-    "**/node_modules/**",
-    "**/dist/**",
-    "**/build/**",
-    "**/.venv/**",
-    "**/venv/**",
-    "**/site-packages/**",
-    "**/__pycache__/**",
-    "**/migrations/**",
-];
 
 const GENERIC_LOOKUPS: &[&str] = &[
     "exact",
@@ -49,6 +31,14 @@ const DJANGO_MODEL_BASES: &[&str] = &[
     "django.db.models.Model",
     "django.contrib.auth.models.AbstractUser",
     "django.contrib.auth.base_user.AbstractBaseUser",
+    "model_utils.models.StatusModel",
+    "model_utils.models.TimeFramedModel",
+    "model_utils.models.TimeStampedModel",
+    "model_utils.models.UUIDModel",
+    "ordered_model.models.OrderedModel",
+    "wagtail.contrib.settings.models.BaseGenericSetting",
+    "wagtail.contrib.settings.models.BaseSiteSetting",
+    "wagtail.models.Page",
 ];
 const QUERYSET_PRESERVING_METHODS: &[&str] = &[
     "all",
@@ -57,6 +47,7 @@ const QUERYSET_PRESERVING_METHODS: &[&str] = &[
     "order_by",
     "select_related",
     "prefetch_related",
+    "fetch_mode",
     "distinct",
     "only",
     "defer",
@@ -149,6 +140,13 @@ impl ModelInfo {
     pub fn field(&self, name: &str) -> Option<&FieldInfo> {
         self.fields.iter().find(|field| field.name == name)
     }
+
+    pub fn relation_for_accessor(&self, name: &str) -> Option<&FieldInfo> {
+        self.fields.iter().find(|field| {
+            field.related_model.is_some()
+                && field.relation_accessor.as_deref().unwrap_or(&field.name) == name
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,18 +168,27 @@ pub struct ModuleAnalysis {
     pub body: Vec<Stmt>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModuleFacts {
+    path: PathBuf,
+    module_name: String,
+    is_package: bool,
+    imports: HashMap<String, String>,
+    local_class_names: HashSet<String>,
+    raw_classes: Vec<RawClassInfo>,
+    settings: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct WorkspaceIndex {
     root: PathBuf,
-    config: DjangoLspConfig,
-    analyses: HashMap<PathBuf, Arc<ModuleAnalysis>>,
     pub modules: HashMap<PathBuf, ModuleInfo>,
     pub models: HashMap<ModelId, ModelInfo>,
     models_by_class_name: HashMap<String, Vec<ModelId>>,
     settings: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RawClassInfo {
     id: ModelId,
     module_name: String,
@@ -190,7 +197,7 @@ struct RawClassInfo {
     fields: Vec<PendingField>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingField {
     name: String,
     kind: FieldKind,
@@ -199,189 +206,30 @@ struct PendingField {
     reverse_accessor_name: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingRelationTarget {
     Qualified(String),
     StringLiteral(String),
     SettingsKey(String),
 }
 
-#[derive(Debug)]
-struct PathMatcher {
-    root: PathBuf,
-    include: Option<GlobSet>,
-    exclude: GlobSet,
-}
-
-impl PathMatcher {
-    fn new(root: &Path, config: &DjangoLspConfig) -> Result<Self> {
-        let include = if config.include.is_empty() {
-            None
-        } else {
-            Some(build_globset(root, &config.include)?)
-        };
-
-        let mut exclude_patterns = DEFAULT_EXCLUDES
-            .iter()
-            .map(|pattern| pattern.to_string())
-            .collect::<Vec<_>>();
-        exclude_patterns.extend(config.exclude.iter().cloned());
-        let exclude = build_globset(root, &exclude_patterns)?;
-
-        Ok(Self {
-            root: root.to_path_buf(),
-            include,
-            exclude,
-        })
-    }
-
-    fn matches(&self, path: &Path) -> bool {
-        if !path.starts_with(&self.root)
-            || path.extension().and_then(|ext| ext.to_str()) != Some("py")
-        {
-            return false;
-        }
-
-        let relative_path = path
-            .strip_prefix(&self.root)
-            .expect("workspace path was checked above");
-        if self.exclude.is_match(relative_path) {
-            return false;
-        }
-
-        self.include
-            .as_ref()
-            .map(|include| include.is_match(relative_path))
-            .unwrap_or(true)
-    }
-}
-
-fn build_globset(root: &Path, patterns: &[String]) -> Result<GlobSet> {
-    let mut builder = GlobSetBuilder::new();
-    for pattern in patterns {
-        builder.add(
-            Glob::new(pattern).map_err(|source| DjangoLspError::glob(pattern.clone(), source))?,
-        );
-        if !pattern.starts_with("**/") && !pattern.starts_with('.') && !pattern.contains('/') {
-            let scoped = format!("**/{pattern}");
-            builder.add(
-                Glob::new(&scoped)
-                    .map_err(|source| DjangoLspError::glob(scoped.clone(), source))?,
-            );
-        }
-    }
-    let _ = root;
-    builder
-        .build()
-        .map_err(|source| DjangoLspError::glob("globset".to_string(), source))
-}
-
 impl WorkspaceIndex {
-    pub fn build(
-        workspace_root: &Path,
+    pub(crate) fn from_facts(
+        root: PathBuf,
         config: DjangoLspConfig,
-        documents: &DocumentStore,
-    ) -> Result<Self> {
-        let root = config.effective_root(workspace_root);
-        let matcher = PathMatcher::new(&root, &config)?;
-        let mut builder = WalkBuilder::new(&root);
-        builder.hidden(false);
-        builder.git_ignore(true);
-        builder.git_global(true);
-        builder.git_exclude(true);
-        builder.parents(true);
-
-        let mut analyses = HashMap::new();
-
-        for entry in builder.build() {
-            let Ok(entry) = entry else {
-                continue;
-            };
-            let path = entry.path();
-            if !entry
-                .file_type()
-                .is_some_and(|file_type| file_type.is_file())
-                || !matcher.matches(path)
-            {
-                continue;
-            }
-
-            let source = if let Some(snapshot) = documents.get(path) {
-                snapshot.text.clone()
-            } else {
-                match fs::read_to_string(path) {
-                    Ok(contents) => contents,
-                    Err(_) => continue,
-                }
-            };
-
-            analyses.insert(
-                path.to_path_buf(),
-                Arc::new(analyze_source(&root, path, &source)),
-            );
-        }
-
-        let mut index = Self {
-            root,
-            config,
-            analyses,
-            modules: HashMap::new(),
-            models: HashMap::new(),
-            models_by_class_name: HashMap::new(),
-            settings: HashMap::new(),
-        };
-        index.rebuild_derived();
-        Ok(index)
-    }
-
-    pub fn refresh_paths(&mut self, paths: &[PathBuf], documents: &DocumentStore) -> Result<usize> {
-        let matcher = PathMatcher::new(&self.root, &self.config)?;
-        let mut refreshed = 0;
-
-        for path in paths {
-            if !matcher.matches(path) {
-                refreshed += usize::from(self.analyses.remove(path).is_some());
-                continue;
-            }
-
-            let source = documents
-                .get(path)
-                .map(|snapshot| snapshot.text.clone())
-                .or_else(|| fs::read_to_string(path).ok());
-
-            if let Some(source) = source {
-                self.analyses.insert(
-                    path.clone(),
-                    Arc::new(analyze_source(&self.root, path, &source)),
-                );
-                refreshed += 1;
-            } else {
-                refreshed += usize::from(self.analyses.remove(path).is_some());
-            }
-        }
-
-        if refreshed > 0 {
-            self.rebuild_derived();
-        }
-
-        Ok(refreshed)
-    }
-
-    fn rebuild_derived(&mut self) {
+        facts: &[&ModuleFacts],
+    ) -> Self {
         let mut modules = HashMap::new();
         let mut raw_classes = Vec::new();
         let mut settings = HashMap::new();
-        let mut analyses = self.analyses.values().collect::<Vec<_>>();
-        analyses.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        let mut facts = facts.to_vec();
+        facts.sort_unstable_by(|left, right| left.path.cmp(&right.path));
 
-        for analysis in &analyses {
-            if is_settings_module(
-                &analysis.module_name,
-                self.config.settings_module.as_deref(),
-            ) {
-                settings.extend(extract_settings_assignments(&analysis.body));
+        for facts in &facts {
+            if is_settings_module(&facts.module_name, config.settings_module.as_deref()) {
+                settings.extend(facts.settings.clone());
             }
-            raw_classes.extend(extract_raw_classes(analysis));
+            raw_classes.extend(facts.raw_classes.iter().cloned());
         }
 
         let mut model_ids = HashSet::new();
@@ -509,55 +357,38 @@ impl WorkspaceIndex {
             }
         }
 
-        for analysis in analyses {
+        for facts in &facts {
             let mut model_names = HashMap::new();
-            for class_name in &analysis.local_class_names {
-                let model_id = ModelId::new(format!("{}.{}", analysis.module_name, class_name));
+            for class_name in &facts.local_class_names {
+                let model_id = ModelId::new(format!("{}.{}", facts.module_name, class_name));
                 if models.contains_key(&model_id) {
                     model_names.insert(class_name.clone(), model_id);
                 }
             }
 
             modules.insert(
-                analysis.path.clone(),
+                facts.path.clone(),
                 ModuleInfo {
-                    path: analysis.path.clone(),
-                    module_name: analysis.module_name.clone(),
-                    is_package: analysis.is_package,
-                    imports: analysis.imports.clone(),
+                    path: facts.path.clone(),
+                    module_name: facts.module_name.clone(),
+                    is_package: facts.is_package,
+                    imports: facts.imports.clone(),
                     model_names,
                 },
             );
         }
 
-        self.modules = modules;
-        self.models = models;
-        self.models_by_class_name = models_by_class_name;
-        self.settings = settings;
-    }
-
-    pub fn empty(root: PathBuf, config: DjangoLspConfig) -> Self {
         Self {
             root,
-            config,
-            analyses: HashMap::new(),
-            modules: HashMap::new(),
-            models: HashMap::new(),
-            models_by_class_name: HashMap::new(),
-            settings: HashMap::new(),
+            modules,
+            models,
+            models_by_class_name,
+            settings,
         }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
-    }
-
-    pub fn config(&self) -> &DjangoLspConfig {
-        &self.config
-    }
-
-    pub fn analyzed_file_count(&self) -> usize {
-        self.analyses.len()
     }
 
     pub fn setting(&self, name: &str) -> Option<&str> {
@@ -651,10 +482,6 @@ impl WorkspaceIndex {
             None
         }
     }
-
-    pub fn analyze_source(&self, path: &Path, source: &str) -> ModuleAnalysis {
-        analyze_source(&self.root, path, source)
-    }
 }
 
 pub fn analyze_source(root: &Path, path: &Path, source: &str) -> ModuleAnalysis {
@@ -679,6 +506,18 @@ pub fn analyze_source(root: &Path, path: &Path, source: &str) -> ModuleAnalysis 
         imports,
         local_class_names,
         body: syntax.body.to_vec(),
+    }
+}
+
+pub(crate) fn facts_from_analysis(analysis: &ModuleAnalysis) -> ModuleFacts {
+    ModuleFacts {
+        path: analysis.path.clone(),
+        module_name: analysis.module_name.clone(),
+        is_package: analysis.is_package,
+        imports: analysis.imports.clone(),
+        local_class_names: analysis.local_class_names.clone(),
+        raw_classes: extract_raw_classes(analysis),
+        settings: extract_settings_assignments(&analysis.body),
     }
 }
 
@@ -725,7 +564,7 @@ fn collect_imports(module_name: &str, is_package: bool, body: &[Stmt]) -> HashMa
     imports
 }
 
-fn apply_import_statement(
+pub(crate) fn apply_import_statement(
     statement: &Stmt,
     module_name: &str,
     is_package: bool,
@@ -1446,16 +1285,26 @@ fn collect_scope_from_statement(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::ops::Deref;
     use std::path::Path;
-    use std::sync::Arc;
 
     use tempfile::tempdir;
 
     use super::*;
-    use crate::document_store::DocumentStore;
+    use crate::analysis::AnalysisDatabase;
 
-    fn build_index(root: &Path) -> WorkspaceIndex {
-        WorkspaceIndex::build(root, DjangoLspConfig::default(), &DocumentStore::default()).unwrap()
+    struct TestIndex(AnalysisDatabase);
+
+    impl Deref for TestIndex {
+        type Target = WorkspaceIndex;
+
+        fn deref(&self) -> &Self::Target {
+            self.0.index()
+        }
+    }
+
+    fn build_index(root: &Path) -> TestIndex {
+        TestIndex(AnalysisDatabase::build(root, DjangoLspConfig::default()).unwrap())
     }
 
     #[test]
@@ -1536,7 +1385,7 @@ from .models import Blog as Post
     }
 
     #[test]
-    fn refreshes_only_changed_file_analysis_and_restores_disk_contents() {
+    fn updates_changed_file_analysis_and_restores_disk_contents() {
         let dir = tempdir().unwrap();
         let app_dir = dir.path().join("blog");
         let models_path = app_dir.join("models.py");
@@ -1551,30 +1400,18 @@ from .models import Blog as Post
         fs::write(&views_path, "from .models import Blog\n").unwrap();
 
         let mut index = build_index(dir.path());
-        let models_before = Arc::clone(index.analyses.get(&models_path).unwrap());
-        let views_before = Arc::clone(index.analyses.get(&views_path).unwrap());
-        let mut documents = DocumentStore::default();
-        documents.open(
-            models_path.clone(),
-            1,
-            "from django.db import models\nclass Blog(models.Model):\n    title = models.CharField()\n    summary = models.TextField()\n"
-                .to_string(),
-        );
-
-        assert_eq!(
+        assert!(
             index
-                .refresh_paths(std::slice::from_ref(&models_path), &documents)
-                .unwrap(),
-            1
+                .0
+                .sync_path(
+                    models_path.clone(),
+                    Some(
+                        "from django.db import models\nclass Blog(models.Model):\n    title = models.CharField()\n    summary = models.TextField()\n"
+                            .to_string(),
+                    ),
+                )
+                .unwrap()
         );
-        assert!(!Arc::ptr_eq(
-            &models_before,
-            index.analyses.get(&models_path).unwrap()
-        ));
-        assert!(Arc::ptr_eq(
-            &views_before,
-            index.analyses.get(&views_path).unwrap()
-        ));
         assert!(
             index
                 .model(&ModelId::new("blog.models.Blog"))
@@ -1583,13 +1420,7 @@ from .models import Blog as Post
                 .is_some()
         );
 
-        documents.close(&models_path);
-        assert_eq!(
-            index
-                .refresh_paths(std::slice::from_ref(&models_path), &documents)
-                .unwrap(),
-            1
-        );
+        assert!(index.0.sync_path_from_disk(models_path).unwrap());
         assert!(
             index
                 .model(&ModelId::new("blog.models.Blog"))
@@ -1618,6 +1449,54 @@ class Blog(django.db.models.Model):
         let index = build_index(dir.path());
         let blog = index.model(&ModelId::new("blog.models.Blog")).unwrap();
         assert!(blog.field("title").is_some());
+    }
+
+    #[test]
+    fn detects_models_from_common_third_party_abstract_bases() {
+        let dir = tempdir().unwrap();
+        let app_dir = dir.path().join("blog");
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::write(
+            app_dir.join("models.py"),
+            r#"
+from django.db import models
+from model_utils.models import TimeStampedModel
+from ordered_model.models import OrderedModel
+from wagtail.models import Page
+
+class Post(TimeStampedModel, OrderedModel):
+    author = models.ForeignKey("Author", on_delete=models.CASCADE)
+
+class Author(TimeStampedModel):
+    name = models.CharField(max_length=64)
+
+class ContentPage(Page):
+    featured_post = models.ForeignKey(Post, on_delete=models.CASCADE)
+"#,
+        )
+        .unwrap();
+
+        let index = build_index(dir.path());
+        for model in ["Post", "Author", "ContentPage"] {
+            assert!(
+                index
+                    .model(&ModelId::new(format!("blog.models.{model}")))
+                    .is_some(),
+                "expected {model} to be indexed"
+            );
+        }
+        assert_eq!(
+            index
+                .model(&ModelId::new("blog.models.Post"))
+                .unwrap()
+                .field("author")
+                .unwrap()
+                .related_model
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "blog.models.Author"
+        );
     }
 
     #[test]
@@ -1745,7 +1624,7 @@ class OtherUser(AbstractUser):
             settings_module: Some("project.production".to_string()),
             ..DjangoLspConfig::default()
         };
-        let index = WorkspaceIndex::build(dir.path(), config, &DocumentStore::default()).unwrap();
+        let index = TestIndex(AnalysisDatabase::build(dir.path(), config).unwrap());
 
         assert_eq!(
             index.setting("AUTH_USER_MODEL"),

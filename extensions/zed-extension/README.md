@@ -1,7 +1,7 @@
 # django-lsp for Zed
 
 This extension runs [`django-lsp`](https://github.com/patrick91/django-lsp) alongside Zed's general
-Python language servers to provide Django ORM query completions.
+Python language servers to provide Django ORM completions and repeated-query diagnostics.
 
 It complements Zed's existing Django extension, which provides Django template language support;
 this extension attaches only to Python files.

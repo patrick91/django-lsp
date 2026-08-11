@@ -1,10 +1,11 @@
 # Django ORM Language Server
 
-Static Django ORM query completions for Visual Studio Code and Cursor, powered by Rust.
+Static Django ORM completions and repeated-query diagnostics for Visual Studio Code and Cursor,
+powered by Rust.
 
 `django-lsp` understands model fields, relationships, and query lookups without importing or
 executing your Django project. It runs alongside Pylance, Pyright, Ruff, or another general Python
-language server and contributes only Django-specific completions.
+language server and contributes only Django-specific behavior.
 
 ```python
 Blog.objects.filter(author__team__name__icontains="Django")
@@ -16,6 +17,8 @@ Blog.objects.filter(author__team__name__icontains="Django")
 - Forward, reverse, and recursive relationship traversal
 - Django field lookups such as `contains`, `icontains`, and `isnull`
 - Relation completions in `select_related` and `prefetch_related`
+- Warnings for relation access in QuerySet loops and comprehensions without the matching
+  `select_related` or `prefetch_related`
 - `AUTH_USER_MODEL`, package re-exports, monorepos, and multi-root workspaces
 - Unsaved editor buffer updates
 

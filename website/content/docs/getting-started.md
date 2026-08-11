@@ -115,6 +115,43 @@ Blog.objects.filter(author__te)
 
 The completion list should include paths such as `author__team`.
 
+## Find repeated relation queries
+
+The editor also warns when a relation access inside a QuerySet loop can issue one additional query
+per row. This example produces `DJ001` on `author` and recommends
+`select_related("author")`:
+
+<!-- django-lsp-diagnostic file=blog/views.py code=DJ001 method=select_related path=author -->
+```python
+from .models import Blog
+
+for blog in Blog.objects.all():
+    print(blog.author.email)
+```
+<!-- django-lsp-diagnostic:end -->
+
+Load the relation on the QuerySet to remove the warning:
+
+```python
+for blog in Blog.objects.select_related("author"):
+    print(blog.author.email)
+```
+
+The same analysis covers list, set, dictionary, and generator comprehensions. Reverse and
+many-to-many access recommends `prefetch_related()` instead. On Django 6.1, `FETCH_PEERS` and
+`RAISE` fetch modes are also understood for single-valued relations. Standalone
+`prefetch_related_objects()` calls are tracked too, including literal `Prefetch` objects.
+
+Run the exact same analysis without an editor from the project root:
+
+```console
+django-lsp check
+django-lsp check blog/views.py
+```
+
+The command prints `path:line:column` warnings and exits with status 1 when it finds diagnostics,
+which makes it suitable for local checks and CI.
+
 ## Next steps
 
 - Browse the generated [completion examples](/docs/completions/).

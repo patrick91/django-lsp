@@ -1,7 +1,7 @@
 {
   "name": "django-lsp",
   "displayName": "Django ORM Language Server",
-  "description": "Django ORM query completions powered by a bundled Rust language server.",
+  "description": "Django ORM completions and repeated-query diagnostics powered by Rust.",
   "version": "0.1.5",
   "publisher": "patrick91",
   "private": true,
@@ -32,7 +32,8 @@
     "orm",
     "python",
     "language-server",
-    "autocomplete"
+    "autocomplete",
+    "n-plus-one"
   ],
   "extensionKind": [
     "workspace"

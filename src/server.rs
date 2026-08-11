@@ -1,27 +1,22 @@
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use tokio::sync::{Mutex, RwLock};
-use tokio::task::JoinHandle;
-use tokio::time::sleep;
+use tokio::sync::Mutex;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
-    CompletionOptions, CompletionResponse, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, InitializeParams, InitializeResult, InitializedParams, MessageType,
-    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
+    CompletionOptions, CompletionResponse, Diagnostic, DiagnosticSeverity,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    InitializeParams, InitializeResult, InitializedParams, MessageType, NumberOrString, Position,
+    Range, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
 };
 use tower_lsp_server::{Client, LanguageServer};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
-use crate::completion::complete_lsp_items;
+use crate::analysis::AnalysisDatabase;
+use crate::completion::complete_lsp_items_from_analysis;
 use crate::config::DjangoLspConfig;
-use crate::document_store::DocumentStore;
 use crate::error::DjangoLspError;
-use crate::index::WorkspaceIndex;
-
-const INDEX_REFRESH_DEBOUNCE: Duration = Duration::from_millis(150);
 
 #[derive(Debug)]
 pub struct Backend {
@@ -31,23 +26,14 @@ pub struct Backend {
 
 #[derive(Debug, Default)]
 pub struct ServerState {
-    inner: RwLock<ServerSnapshot>,
-    refresh: Mutex<RefreshQueue>,
-}
-
-#[derive(Debug, Default)]
-struct RefreshQueue {
-    generation: u64,
-    pending_paths: HashSet<PathBuf>,
-    task: Option<JoinHandle<()>>,
+    inner: Mutex<ServerSnapshot>,
 }
 
 #[derive(Debug, Default)]
 struct ServerSnapshot {
     workspace_root: Option<PathBuf>,
     config: DjangoLspConfig,
-    documents: DocumentStore,
-    index: WorkspaceIndex,
+    database: AnalysisDatabase,
 }
 
 impl Backend {
@@ -55,95 +41,77 @@ impl Backend {
         Self { client, state }
     }
 
-    async fn update_document_and_schedule<F>(&self, path: PathBuf, update: F)
-    where
-        F: FnOnce(&mut DocumentStore, &Path) + Send,
-    {
-        let state = Arc::downgrade(&self.state);
-        let client = self.client.clone();
-        let mut refresh = self.state.refresh.lock().await;
-        refresh.generation += 1;
-        let generation = refresh.generation;
-        refresh.pending_paths.insert(path.clone());
-
-        if let Some(task) = refresh.task.take() {
-            task.abort();
+    async fn sync_document(
+        &self,
+        path: PathBuf,
+        contents: Option<String>,
+        uri: tower_lsp_server::ls_types::Uri,
+        version: i32,
+    ) {
+        let result = {
+            let mut snapshot = self.state.inner.lock().await;
+            snapshot
+                .database
+                .sync_path(path.clone(), contents)
+                .map(|_| {
+                    let source = snapshot.database.source_for_path(&path).unwrap_or_default();
+                    snapshot.database.diagnostics_for_path(&path).map_or_else(
+                        Vec::new,
+                        |diagnostics| {
+                            diagnostics
+                                .iter()
+                                .map(|diagnostic| Diagnostic {
+                                    range: offsets_to_range(
+                                        source,
+                                        diagnostic.range.start().to_usize(),
+                                        diagnostic.range.end().to_usize(),
+                                    ),
+                                    severity: Some(DiagnosticSeverity::WARNING),
+                                    code: Some(NumberOrString::String(diagnostic.code.to_string())),
+                                    source: Some("django-lsp".to_string()),
+                                    message: diagnostic.message.clone(),
+                                    ..Diagnostic::default()
+                                })
+                                .collect()
+                        },
+                    )
+                })
+        };
+        match result {
+            Ok(diagnostics) => {
+                self.client
+                    .publish_diagnostics(uri, diagnostics, Some(version))
+                    .await;
+            }
+            Err(error) => {
+                warn!("analysis input update failed: {error}");
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("django-lsp failed to update its analysis inputs: {error}"),
+                    )
+                    .await;
+            }
         }
+    }
 
-        {
-            let mut snapshot = self.state.inner.write().await;
-            update(&mut snapshot.documents, &path);
+    async fn restore_document_from_disk(&self, path: PathBuf) {
+        let result = self
+            .state
+            .inner
+            .lock()
+            .await
+            .database
+            .sync_path_from_disk(path);
+        if let Err(error) = result {
+            warn!("analysis input restore failed: {error}");
+            self.client
+                .log_message(
+                    MessageType::ERROR,
+                    format!("django-lsp failed to restore its analysis inputs: {error}"),
+                )
+                .await;
         }
-
-        refresh.task = Some(tokio::spawn(async move {
-            sleep(INDEX_REFRESH_DEBOUNCE).await;
-            let Some(state) = state.upgrade() else {
-                return;
-            };
-
-            let paths = {
-                let refresh = state.refresh.lock().await;
-                if refresh.generation != generation {
-                    return;
-                }
-                refresh.pending_paths.iter().cloned().collect::<Vec<_>>()
-            };
-            let (mut index, documents) = {
-                let snapshot = state.inner.read().await;
-                (snapshot.index.clone(), snapshot.documents.clone())
-            };
-            let started = Instant::now();
-            let result = tokio::task::spawn_blocking(move || {
-                let refreshed_files = index.refresh_paths(&paths, &documents)?;
-                Ok::<_, DjangoLspError>((index, paths, refreshed_files))
-            })
-            .await;
-
-            let (index, paths, refreshed_files) = match result {
-                Ok(Ok(result)) => result,
-                Ok(Err(error)) => {
-                    warn!("index refresh failed: {error}");
-                    client
-                        .log_message(
-                            MessageType::ERROR,
-                            format!("django-lsp failed to refresh index: {error}"),
-                        )
-                        .await;
-                    return;
-                }
-                Err(error) => {
-                    warn!("index refresh task failed: {error}");
-                    client
-                        .log_message(
-                            MessageType::ERROR,
-                            format!("django-lsp index refresh task failed: {error}"),
-                        )
-                        .await;
-                    return;
-                }
-            };
-
-            let elapsed = started.elapsed();
-            let mut refresh = state.refresh.lock().await;
-            if refresh.generation != generation {
-                debug!(generation, "discarded stale workspace index refresh");
-                return;
-            }
-
-            {
-                let mut snapshot = state.inner.write().await;
-                snapshot.index = index;
-            }
-            for path in &paths {
-                refresh.pending_paths.remove(path);
-            }
-            debug!(
-                generation,
-                refreshed_files,
-                elapsed_ms = elapsed.as_secs_f64() * 1_000.0,
-                "workspace index refreshed"
-            );
-        }));
     }
 
     #[allow(deprecated)]
@@ -181,36 +149,34 @@ impl LanguageServer for Backend {
             DjangoLspConfig::default()
         };
         let started = Instant::now();
-        let index = if let Some(root) = workspace_root.clone() {
+        let database = if let Some(root) = workspace_root.clone() {
             let build_config = config.clone();
-            match tokio::task::spawn_blocking(move || {
-                WorkspaceIndex::build(&root, build_config, &DocumentStore::default())
-            })
-            .await
+            match tokio::task::spawn_blocking(move || AnalysisDatabase::build(&root, build_config))
+                .await
             {
-                Ok(Ok(index)) => index,
+                Ok(Ok(database)) => database,
                 Ok(Err(error)) => {
-                    warn!("initial index build failed: {error}");
-                    WorkspaceIndex::empty(workspace_root.clone().unwrap(), config.clone())
+                    warn!("initial analysis database build failed: {error}");
+                    AnalysisDatabase::empty(workspace_root.clone().unwrap(), config.clone())
                 }
                 Err(error) => {
-                    warn!("initial index build task failed: {error}");
-                    WorkspaceIndex::empty(workspace_root.clone().unwrap(), config.clone())
+                    warn!("initial analysis database task failed: {error}");
+                    AnalysisDatabase::empty(workspace_root.clone().unwrap(), config.clone())
                 }
             }
         } else {
-            WorkspaceIndex::empty(PathBuf::from("."), config.clone())
+            AnalysisDatabase::empty(PathBuf::from("."), config.clone())
         };
         info!(
-            analyzed_files = index.analyzed_file_count(),
+            analyzed_files = database.analyzed_file_count(),
             elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
-            "workspace index initialized"
+            "analysis database initialized"
         );
 
-        let mut snapshot = self.state.inner.write().await;
+        let mut snapshot = self.state.inner.lock().await;
         snapshot.workspace_root = workspace_root;
         snapshot.config = config;
-        snapshot.index = index;
+        snapshot.database = database;
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -242,41 +208,36 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        let Ok(path) = Self::path_from_uri(&params.text_document.uri) else {
+        let uri = params.text_document.uri;
+        let Ok(path) = Self::path_from_uri(&uri) else {
             return;
         };
-        let version = params.text_document.version;
         let text = params.text_document.text;
-        self.update_document_and_schedule(path, move |documents, path| {
-            documents.open(path.to_path_buf(), version, text);
-        })
-        .await;
+        self.sync_document(path, Some(text), uri, params.text_document.version)
+            .await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        let Ok(path) = Self::path_from_uri(&params.text_document.uri) else {
+        let uri = params.text_document.uri;
+        let Ok(path) = Self::path_from_uri(&uri) else {
             return;
         };
         let Some(change) = params.content_changes.into_iter().next() else {
             return;
         };
 
-        let version = params.text_document.version;
-        self.update_document_and_schedule(path, move |documents, path| {
-            documents.update(path.to_path_buf(), version, change.text);
-        })
-        .await;
+        self.sync_document(path, Some(change.text), uri, params.text_document.version)
+            .await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        let Ok(path) = Self::path_from_uri(&params.text_document.uri) else {
+        let uri = params.text_document.uri;
+        let Ok(path) = Self::path_from_uri(&uri) else {
             return;
         };
 
-        self.update_document_and_schedule(path, |documents, path| {
-            documents.close(path);
-        })
-        .await;
+        self.restore_document_from_disk(path).await;
+        self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
 
     async fn completion(
@@ -287,17 +248,16 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        let source = {
-            let snapshot = self.state.inner.read().await;
-            match snapshot.documents.source_for_path(&path) {
-                Ok(source) => source,
-                Err(_) => return Ok(None),
-            }
+        let snapshot = self.state.inner.lock().await;
+        let Some(source) = snapshot.database.source_for_path(&path) else {
+            return Ok(None);
         };
-
-        let cursor = position_to_offset(&source, params.text_document_position.position);
-        let snapshot = self.state.inner.read().await;
-        let items = complete_lsp_items(&snapshot.index, Path::new(&path), &source, cursor);
+        let Some(analysis) = snapshot.database.analysis_for_path(&path) else {
+            return Ok(None);
+        };
+        let cursor = position_to_offset(source, params.text_document_position.position);
+        let items =
+            complete_lsp_items_from_analysis(snapshot.database.index(), analysis, source, cursor);
         if items.is_empty() {
             Ok(None)
         } else {
@@ -306,7 +266,7 @@ impl LanguageServer for Backend {
     }
 }
 
-fn position_to_offset(source: &str, position: tower_lsp_server::ls_types::Position) -> usize {
+fn position_to_offset(source: &str, position: Position) -> usize {
     let mut line = 0u32;
     let mut column = 0u32;
     let mut offset = 0usize;
@@ -339,11 +299,43 @@ fn position_to_offset(source: &str, position: tower_lsp_server::ls_types::Positi
     offset
 }
 
+fn offsets_to_range(source: &str, start: usize, end: usize) -> Range {
+    Range {
+        start: offset_to_position(source, start),
+        end: offset_to_position(source, end),
+    }
+}
+
+fn offset_to_position(source: &str, offset: usize) -> Position {
+    let mut line = 0u32;
+    let mut column = 0u32;
+    let mut seen = 0usize;
+
+    for ch in source.chars() {
+        if seen >= offset {
+            break;
+        }
+        let len = ch.len_utf8();
+        if seen + len > offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            column = 0;
+        } else {
+            column += ch.len_utf16() as u32;
+        }
+        seen += len;
+    }
+
+    Position::new(line, column)
+}
+
 #[cfg(test)]
 mod tests {
     use tower_lsp_server::ls_types::Position;
 
-    use super::position_to_offset;
+    use super::{offset_to_position, position_to_offset};
 
     #[test]
     fn converts_utf16_positions_to_byte_offsets() {
@@ -355,6 +347,18 @@ mod tests {
         assert_eq!(
             position_to_offset(source, Position::new(1, 4)),
             source.len()
+        );
+    }
+
+    #[test]
+    fn converts_byte_offsets_to_utf16_positions() {
+        let source = "a😀b\ncafé";
+
+        assert_eq!(offset_to_position(source, 0), Position::new(0, 0));
+        assert_eq!(offset_to_position(source, 5), Position::new(0, 3));
+        assert_eq!(
+            offset_to_position(source, source.len()),
+            Position::new(1, 4)
         );
     }
 }

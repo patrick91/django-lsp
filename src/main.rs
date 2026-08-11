@@ -1,13 +1,22 @@
+use std::path::{Path, PathBuf};
 use std::{ffi::OsString, process::ExitCode, sync::Arc};
 
+use django_lsp::analysis::AnalysisDatabase;
+use django_lsp::config::DjangoLspConfig;
 use django_lsp::server::{Backend, ServerState};
 use tokio::io::{stdin, stdout};
 use tower_lsp_server::{LspService, Server};
 use tracing_subscriber::EnvFilter;
 
-const HELP: &str = "django-lsp - Django ORM completion language server
+const HELP: &str = "django-lsp - Django ORM language server and query checker
 
-Usage: django-lsp [OPTIONS]
+Usage:
+  django-lsp
+  django-lsp check [PATH ...]
+  django-lsp [OPTIONS]
+
+Commands:
+  check [PATH ...]  Check Python files for repeated ORM relation queries
 
 Options:
   -h, --help     Print help
@@ -18,6 +27,7 @@ With no options, django-lsp communicates with an editor over standard input and 
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
     Serve,
+    Check(Vec<PathBuf>),
     Help,
     Version,
 }
@@ -29,8 +39,16 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Action, String
         [] => Ok(Action::Serve),
         [arg] if arg == "-h" || arg == "--help" => Ok(Action::Help),
         [arg] if arg == "-V" || arg == "--version" => Ok(Action::Version),
+        [command, arg]
+            if command == "check" && (arg.as_os_str() == "-h" || arg.as_os_str() == "--help") =>
+        {
+            Ok(Action::Help)
+        }
+        [command, paths @ ..] if command == "check" => Ok(Action::Check(
+            paths.iter().map(PathBuf::from).collect::<Vec<_>>(),
+        )),
         [arg] => Err(format!("unexpected argument: {}", arg.to_string_lossy())),
-        _ => Err("django-lsp accepts at most one option".to_string()),
+        _ => Err("unexpected arguments".to_string()),
     }
 }
 
@@ -45,6 +63,7 @@ async fn main() -> ExitCode {
             println!("django-lsp {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
+        Ok(Action::Check(paths)) => return run_check(&paths),
         Ok(Action::Serve) => {}
         Err(error) => {
             eprintln!("error: {error}");
@@ -65,9 +84,103 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn run_check(requested_paths: &[PathBuf]) -> ExitCode {
+    let workspace = match std::env::current_dir() {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            eprintln!("error: failed to determine the current directory: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let config = match DjangoLspConfig::load(&workspace) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let database = match AnalysisDatabase::build(&workspace, config) {
+        Ok(database) => database,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let requested_paths = match normalize_requested_paths(&workspace, requested_paths) {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut count = 0usize;
+    for path in database.paths() {
+        if !requested_paths.is_empty()
+            && !requested_paths
+                .iter()
+                .any(|requested| path == *requested || path.starts_with(requested))
+        {
+            continue;
+        }
+        let Some(source) = database.source_for_path(&path) else {
+            continue;
+        };
+        let Some(diagnostics) = database.diagnostics_for_path(&path) else {
+            continue;
+        };
+        for diagnostic in diagnostics {
+            let (line, column) = line_column(source, diagnostic.range.start().to_usize());
+            let display_path = path.strip_prefix(&workspace).unwrap_or(&path);
+            println!(
+                "{}:{line}:{column}: warning {}: {}",
+                display_path.display(),
+                diagnostic.code,
+                diagnostic.message
+            );
+            count += 1;
+        }
+    }
+
+    if count == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+fn normalize_requested_paths(workspace: &Path, paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    paths
+        .iter()
+        .map(|path| {
+            let path = if path.is_absolute() {
+                path.clone()
+            } else {
+                workspace.join(path)
+            };
+            path.canonicalize()
+                .map_err(|error| format!("failed to resolve `{}`: {error}", path.display()))
+        })
+        .collect()
+}
+
+fn line_column(source: &str, offset: usize) -> (usize, usize) {
+    let prefix = source.get(..offset).unwrap_or(source);
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map_or(prefix, |(_, line)| line)
+        .chars()
+        .count()
+        + 1;
+    (line, column)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Action, parse_args};
+    use std::path::PathBuf;
+
+    use super::{Action, line_column, parse_args};
 
     #[test]
     fn no_arguments_starts_the_server() {
@@ -78,6 +191,10 @@ mod tests {
     fn parses_help_and_version_options() {
         for option in ["-h", "--help"] {
             assert_eq!(parse_args([option.into()]).unwrap(), Action::Help);
+            assert_eq!(
+                parse_args(["check".into(), option.into()]).unwrap(),
+                Action::Help
+            );
         }
 
         for option in ["-V", "--version"] {
@@ -86,8 +203,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_check_paths() {
+        assert_eq!(
+            parse_args(["check".into(), "blog".into(), "users/views.py".into()]).unwrap(),
+            Action::Check(vec![PathBuf::from("blog"), PathBuf::from("users/views.py")])
+        );
+    }
+
+    #[test]
     fn rejects_arguments_that_would_corrupt_the_lsp_transport() {
         assert!(parse_args(["--stdio".into()]).is_err());
         assert!(parse_args(["--help".into(), "extra".into()]).is_err());
+    }
+
+    #[test]
+    fn reports_one_based_locations() {
+        assert_eq!(line_column("one\ntwo", 5), (2, 2));
     }
 }

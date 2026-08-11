@@ -7,7 +7,7 @@ use tower_lsp_server::ls_types::{
 };
 
 use crate::index::{
-    FieldInfo, ModelId, WorkspaceIndex, analyze_source, collect_visible_scope,
+    FieldInfo, ModelId, ModuleAnalysis, WorkspaceIndex, analyze_source, collect_visible_scope,
     infer_model_for_expression,
 };
 
@@ -50,6 +50,15 @@ pub fn complete(
     };
 
     let analysis = analyze_source(index.root(), path, source);
+    complete_with_analysis(index, &analysis, cursor_offset, request)
+}
+
+fn complete_with_analysis(
+    index: &WorkspaceIndex,
+    analysis: &ModuleAnalysis,
+    cursor_offset: usize,
+    request: CompletionRequest,
+) -> Vec<CompletionCandidate> {
     let mut imports = analysis.imports.clone();
     let mut bindings = HashMap::new();
     collect_visible_scope(
@@ -96,7 +105,31 @@ pub fn complete_lsp_items(
     };
 
     let range = offsets_to_range(source, request.replace_start, request.replace_end);
-    complete(index, path, source, cursor_offset)
+    let analysis = analyze_source(index.root(), path, source);
+    complete_lsp_items_with_analysis(index, &analysis, cursor_offset, request, range)
+}
+
+pub(crate) fn complete_lsp_items_from_analysis(
+    index: &WorkspaceIndex,
+    analysis: &ModuleAnalysis,
+    source: &str,
+    cursor_offset: usize,
+) -> Vec<CompletionItem> {
+    let Some(request) = extract_completion_request(source, cursor_offset) else {
+        return Vec::new();
+    };
+    let range = offsets_to_range(source, request.replace_start, request.replace_end);
+    complete_lsp_items_with_analysis(index, analysis, cursor_offset, request, range)
+}
+
+fn complete_lsp_items_with_analysis(
+    index: &WorkspaceIndex,
+    analysis: &ModuleAnalysis,
+    cursor_offset: usize,
+    request: CompletionRequest,
+    range: Range,
+) -> Vec<CompletionItem> {
+    complete_with_analysis(index, analysis, cursor_offset, request)
         .into_iter()
         .enumerate()
         .map(|(order, candidate)| CompletionItem {
@@ -678,15 +711,26 @@ fn offset_to_position(source: &str, offset: usize) -> tower_lsp_server::ls_types
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::ops::Deref;
 
     use tempfile::tempdir;
 
     use super::*;
+    use crate::analysis::AnalysisDatabase;
     use crate::config::DjangoLspConfig;
-    use crate::document_store::DocumentStore;
     use crate::index::WorkspaceIndex;
 
-    fn fixture_index(files: &[(&str, &str)]) -> (tempfile::TempDir, WorkspaceIndex) {
+    struct TestIndex(AnalysisDatabase);
+
+    impl Deref for TestIndex {
+        type Target = WorkspaceIndex;
+
+        fn deref(&self) -> &Self::Target {
+            self.0.index()
+        }
+    }
+
+    fn fixture_index(files: &[(&str, &str)]) -> (tempfile::TempDir, TestIndex) {
         let dir = tempdir().unwrap();
         for (relative, contents) in files {
             let path = dir.path().join(relative);
@@ -696,13 +740,8 @@ mod tests {
             fs::write(path, contents).unwrap();
         }
 
-        let index = WorkspaceIndex::build(
-            dir.path(),
-            DjangoLspConfig::default(),
-            &DocumentStore::default(),
-        )
-        .unwrap();
-        (dir, index)
+        let index = AnalysisDatabase::build(dir.path(), DjangoLspConfig::default()).unwrap();
+        (dir, TestIndex(index))
     }
 
     fn labels(items: Vec<CompletionCandidate>) -> Vec<String> {
@@ -1011,15 +1050,16 @@ Team.objects.filter(auth)
         )
         .unwrap();
 
-        let mut documents = DocumentStore::default();
-        documents.open(
-            dir.path().join("blog/models.py"),
-            2,
-            "from django.db import models\n\nclass Blog(models.Model):\n    title = models.CharField(max_length=255)\n    new_field = models.IntegerField()\n".to_string(),
-        );
-
-        let index =
-            WorkspaceIndex::build(dir.path(), DjangoLspConfig::default(), &documents).unwrap();
+        let mut database = AnalysisDatabase::build(dir.path(), DjangoLspConfig::default()).unwrap();
+        database
+            .sync_path(
+                dir.path().join("blog/models.py"),
+                Some(
+                    "from django.db import models\n\nclass Blog(models.Model):\n    title = models.CharField(max_length=255)\n    new_field = models.IntegerField()\n".to_string(),
+                ),
+            )
+            .unwrap();
+        let index = TestIndex(database);
         let source = fs::read_to_string(dir.path().join("blog/views.py")).unwrap();
         let cursor = source.find("ne)").unwrap() + 2;
         let items = complete(&index, &dir.path().join("blog/views.py"), &source, cursor);

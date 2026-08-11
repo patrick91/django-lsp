@@ -24,7 +24,8 @@ href = "/docs/"
 enabled = true
 component = "Home"
 title = "django-lsp"
-description = "Django ORM autocomplete that understands your models. Follow fields and relations without importing Django or running your project."
+tagline = "Django ORM analysis"
+description = "Autocomplete that follows your models and diagnostics that catch repeated relation queries, without importing Django or running your project."
 install_command = "uv tool install django-lsp"
 cta_text = "Get Started"
 cta_href = "/docs/"
@@ -39,8 +40,8 @@ description = "Traverses forward, reverse, many-to-many, and configured user-mod
 
 [[tool.cross-docs.home.features]]
 title = "Editor friendly"
-description = "Runs alongside Pylance, Pyright, Ruff, or another general-purpose Python language server."
+description = "Completes ORM expressions and warns about repeated relation queries alongside your general-purpose Python tools."
 
 [[tool.cross-docs.home.features]]
-title = "Responsive indexing"
-description = "Caches and debounces workspace indexing, so completions stay fresh while you type."
+title = "Incremental by default"
+description = "Uses Salsa to recompute only the affected analysis queries, so completions and diagnostics stay fresh while you type."

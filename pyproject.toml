@@ -5,11 +5,11 @@ build-backend = "maturin"
 [project]
 name = "django-lsp"
 dynamic = ["version"]
-description = "A language server for Django ORM query completions"
+description = "Static Django ORM completions and repeated-query diagnostics"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
-keywords = ["django", "lsp", "language-server", "autocomplete"]
+keywords = ["django", "lsp", "language-server", "autocomplete", "n-plus-one"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",

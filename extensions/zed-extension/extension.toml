@@ -3,7 +3,7 @@ name = "django-lsp"
 version = "0.1.0"
 schema_version = 1
 authors = ["Patrick Arminio"]
-description = "Django ORM query completions for Python"
+description = "Django ORM completions and repeated-query diagnostics for Python"
 repository = "https://github.com/patrick91/django-lsp"
 
 [language_servers.django-lsp]
