@@ -11,9 +11,13 @@ one-click installation and lifecycle management in each editor.
 Extensions should run `django-lsp` alongside a general Python language server. They are responsible
 only for locating or packaging the executable and connecting it over standard input and output.
 
-Tagged releases publish the five platform-specific VS Code packages through GitHub Actions using
-Microsoft Entra workload identity federation. The `vscode-marketplace` GitHub environment needs
-two Actions variables: `AZURE_CLIENT_ID` and `AZURE_TENANT_ID`.
+Tagged releases publish the five platform-specific VS Code packages to both the Visual Studio
+Marketplace and Open VSX. The Release workflow can also be dispatched manually to publish the
+current version to Open VSX without republishing the Python package or GitHub release.
+
+Visual Studio Marketplace publishing uses Microsoft Entra workload identity federation. The
+`vscode-marketplace` GitHub environment needs two Actions variables: `AZURE_CLIENT_ID` and
+`AZURE_TENANT_ID`.
 
 The client ID belongs to a user-assigned Azure managed identity with:
 
@@ -24,3 +28,7 @@ The client ID belongs to a user-assigned Azure managed identity with:
 
 No long-lived publishing token is stored in GitHub. The workflow exchanges GitHub's short-lived
 OIDC token for a Microsoft Entra token and passes that identity to `vsce --azure-credential`.
+
+Open VSX publishing uses the `patrick91` namespace. The `open-vsx` GitHub environment needs an
+environment secret named `OVSX_PAT`, containing a dedicated Open VSX access token. The workflow
+passes it to the pinned `ovsx` CLI through its supported `OVSX_PAT` environment variable.
