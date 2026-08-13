@@ -356,7 +356,11 @@ impl Analyzer<'_> {
         all_selectable: bool,
         range: TextRange,
     ) {
-        if relation_is_loaded(query, &relation_path, all_selectable) {
+        if relation_is_loaded(query, &relation_path, all_selectable)
+            || self
+                .analysis
+                .suppresses_diagnostic(MISSING_EAGER_LOAD, range.start())
+        {
             return;
         }
 

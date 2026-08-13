@@ -38,6 +38,27 @@ workspace depth.
 exclude = ["apps/generated/**", "vendor/**"]
 ```
 
+For an initial production-only CI rollout, exclude common test layouts explicitly:
+
+```toml
+exclude = ["**/tests/**", "**/tests.py", "**/test_*.py"]
+```
+
+These patterns affect both editor diagnostics and `django-lsp check`, so local and CI results stay
+consistent.
+
+## Inline diagnostic suppression
+
+Suppress an intentional warning on the line where it is reported by naming its diagnostic code:
+
+```python
+for blog in Blog.objects.all():
+    audit(blog.author.email)  # django-lsp: ignore[DJ001]
+```
+
+The directive must be a Python comment, not text inside a string. Keep suppressions narrow and use
+`exclude` when an entire generated or test path should not be analyzed.
+
 ## `workspace_root`
 
 Changes the Python import root. Relative paths are resolved from the editor workspace; absolute

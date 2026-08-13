@@ -4,6 +4,7 @@ use std::{ffi::OsString, process::ExitCode, sync::Arc};
 use django_lsp::analysis::AnalysisDatabase;
 use django_lsp::config::DjangoLspConfig;
 use django_lsp::server::{Backend, ServerState};
+use serde::Serialize;
 use tokio::io::{stdin, stdout};
 use tower_lsp_server::{LspService, Server};
 use tracing_subscriber::EnvFilter;
@@ -12,11 +13,14 @@ const HELP: &str = "django-lsp - Django ORM language server and query checker
 
 Usage:
   django-lsp
-  django-lsp check [PATH ...]
+  django-lsp check [OPTIONS] [PATH ...]
   django-lsp [OPTIONS]
 
 Commands:
   check [PATH ...]  Check Python files for repeated ORM relation queries
+
+Check options:
+  --format <FORMAT>  Output format: text, json, or github [default: text]
 
 Options:
   -h, --help     Print help
@@ -27,9 +31,55 @@ With no options, django-lsp communicates with an editor over standard input and 
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
     Serve,
-    Check(Vec<PathBuf>),
+    Check(CheckOptions),
     Help,
     Version,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CheckOptions {
+    paths: Vec<PathBuf>,
+    format: OutputFormat,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum OutputFormat {
+    #[default]
+    Text,
+    Json,
+    Github,
+}
+
+impl OutputFormat {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "text" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
+            "github" => Ok(Self::Github),
+            _ => Err(format!(
+                "invalid format `{value}`; expected text, json, or github"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct CheckDiagnostic {
+    path: String,
+    line: usize,
+    column: usize,
+    end_line: usize,
+    end_column: usize,
+    severity: &'static str,
+    code: &'static str,
+    message: String,
+    suggestion: CheckSuggestion,
+}
+
+#[derive(Debug, Serialize)]
+struct CheckSuggestion {
+    method: &'static str,
+    relation: String,
 }
 
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Action, String> {
@@ -39,17 +89,44 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Action, String
         [] => Ok(Action::Serve),
         [arg] if arg == "-h" || arg == "--help" => Ok(Action::Help),
         [arg] if arg == "-V" || arg == "--version" => Ok(Action::Version),
-        [command, arg]
-            if command == "check" && (arg.as_os_str() == "-h" || arg.as_os_str() == "--help") =>
-        {
-            Ok(Action::Help)
-        }
-        [command, paths @ ..] if command == "check" => Ok(Action::Check(
-            paths.iter().map(PathBuf::from).collect::<Vec<_>>(),
-        )),
+        [command, check_args @ ..] if command == "check" => parse_check_args(check_args),
         [arg] => Err(format!("unexpected argument: {}", arg.to_string_lossy())),
         _ => Err("unexpected arguments".to_string()),
     }
+}
+
+fn parse_check_args(args: &[OsString]) -> Result<Action, String> {
+    let mut options = CheckOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        let value = argument.to_string_lossy();
+        match value.as_ref() {
+            "-h" | "--help" => return Ok(Action::Help),
+            "--" => {
+                options
+                    .paths
+                    .extend(args[index + 1..].iter().map(PathBuf::from));
+                break;
+            }
+            "--format" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "`--format` requires a value".to_string())?;
+                options.format = OutputFormat::parse(&value.to_string_lossy())?;
+            }
+            value if value.starts_with("--format=") => {
+                options.format = OutputFormat::parse(&value["--format=".len()..])?;
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unexpected check option: {value}"));
+            }
+            _ => options.paths.push(PathBuf::from(argument)),
+        }
+        index += 1;
+    }
+    Ok(Action::Check(options))
 }
 
 #[tokio::main]
@@ -63,7 +140,7 @@ async fn main() -> ExitCode {
             println!("django-lsp {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
-        Ok(Action::Check(paths)) => return run_check(&paths),
+        Ok(Action::Check(options)) => return run_check(&options),
         Ok(Action::Serve) => {}
         Err(error) => {
             eprintln!("error: {error}");
@@ -84,7 +161,7 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_check(requested_paths: &[PathBuf]) -> ExitCode {
+fn run_check(options: &CheckOptions) -> ExitCode {
     let workspace = match std::env::current_dir() {
         Ok(workspace) => workspace,
         Err(error) => {
@@ -107,14 +184,14 @@ fn run_check(requested_paths: &[PathBuf]) -> ExitCode {
         }
     };
 
-    let requested_paths = match normalize_requested_paths(&workspace, requested_paths) {
+    let requested_paths = match normalize_requested_paths(&workspace, &options.paths) {
         Ok(paths) => paths,
         Err(error) => {
             eprintln!("error: {error}");
             return ExitCode::from(2);
         }
     };
-    let mut count = 0usize;
+    let mut findings = Vec::new();
     for path in database.paths() {
         if !requested_paths.is_empty()
             && !requested_paths
@@ -131,22 +208,77 @@ fn run_check(requested_paths: &[PathBuf]) -> ExitCode {
         };
         for diagnostic in diagnostics {
             let (line, column) = line_column(source, diagnostic.range.start().to_usize());
+            let (end_line, end_column) = line_column(source, diagnostic.range.end().to_usize());
             let display_path = path.strip_prefix(&workspace).unwrap_or(&path);
-            println!(
-                "{}:{line}:{column}: warning {}: {}",
-                display_path.display(),
-                diagnostic.code,
-                diagnostic.message
-            );
-            count += 1;
+            findings.push(CheckDiagnostic {
+                path: display_path.to_string_lossy().replace('\\', "/"),
+                line,
+                column,
+                end_line,
+                end_column,
+                severity: "warning",
+                code: diagnostic.code,
+                message: diagnostic.message.clone(),
+                suggestion: CheckSuggestion {
+                    method: diagnostic.method,
+                    relation: diagnostic.relation_path.clone(),
+                },
+            });
         }
     }
 
-    if count == 0 {
+    if let Err(error) = print_findings(&findings, options.format) {
+        eprintln!("error: failed to format diagnostics: {error}");
+        return ExitCode::from(2);
+    }
+
+    if findings.is_empty() {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
     }
+}
+
+fn print_findings(findings: &[CheckDiagnostic], format: OutputFormat) -> serde_json::Result<()> {
+    match format {
+        OutputFormat::Text => {
+            for finding in findings {
+                println!(
+                    "{}:{}:{}: warning {}: {}",
+                    finding.path, finding.line, finding.column, finding.code, finding.message
+                );
+            }
+        }
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(findings)?),
+        OutputFormat::Github => {
+            for finding in findings {
+                println!(
+                    "::warning file={},line={},col={},endLine={},endColumn={},title={}::{}",
+                    escape_github_property(&finding.path),
+                    finding.line,
+                    finding.column,
+                    finding.end_line,
+                    finding.end_column,
+                    escape_github_property(finding.code),
+                    escape_github_message(&finding.message),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn escape_github_message(value: &str) -> String {
+    value
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+}
+
+fn escape_github_property(value: &str) -> String {
+    escape_github_message(value)
+        .replace(':', "%3A")
+        .replace(',', "%2C")
 }
 
 fn normalize_requested_paths(workspace: &Path, paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
@@ -180,7 +312,7 @@ fn line_column(source: &str, offset: usize) -> (usize, usize) {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{Action, line_column, parse_args};
+    use super::{Action, CheckOptions, OutputFormat, line_column, parse_args};
 
     #[test]
     fn no_arguments_starts_the_server() {
@@ -206,8 +338,37 @@ mod tests {
     fn parses_check_paths() {
         assert_eq!(
             parse_args(["check".into(), "blog".into(), "users/views.py".into()]).unwrap(),
-            Action::Check(vec![PathBuf::from("blog"), PathBuf::from("users/views.py")])
+            Action::Check(CheckOptions {
+                paths: vec![PathBuf::from("blog"), PathBuf::from("users/views.py")],
+                format: OutputFormat::Text,
+            })
         );
+    }
+
+    #[test]
+    fn parses_check_output_formats() {
+        assert_eq!(
+            parse_args([
+                "check".into(),
+                "--format".into(),
+                "json".into(),
+                "blog".into(),
+            ])
+            .unwrap(),
+            Action::Check(CheckOptions {
+                paths: vec![PathBuf::from("blog")],
+                format: OutputFormat::Json,
+            })
+        );
+        assert_eq!(
+            parse_args(["check".into(), "--format=github".into()]).unwrap(),
+            Action::Check(CheckOptions {
+                paths: Vec::new(),
+                format: OutputFormat::Github,
+            })
+        );
+        assert!(parse_args(["check".into(), "--format".into()]).is_err());
+        assert!(parse_args(["check".into(), "--format=sarif".into()]).is_err());
     }
 
     #[test]
