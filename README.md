@@ -1,8 +1,8 @@
 # django-lsp
 
-`django-lsp` is a Rust language server focused on Django ORM query completions. It uses Ruff's
-Python parser to build a static workspace index and follows Django model relations without importing
-or executing the project.
+`django-lsp` is a Rust language server and command-line checker focused on Django ORM queries. It
+uses Ruff's Python parser and an incremental Salsa database to follow Django model relations without
+importing or executing the project.
 
 ```python
 from .models import Blog
@@ -27,6 +27,13 @@ django-lsp --version
 
 Point an editor's LSP client at the `django-lsp` command, with no arguments. The server uses standard
 input and output for LSP communication.
+
+Run the same repeated-query analysis from a terminal with:
+
+```console
+django-lsp check
+django-lsp check path/to/views.py
+```
 
 ### Visual Studio Code
 
@@ -73,6 +80,13 @@ bun run serve
 - workspace model indexing
 - completion inside `filter(...)`, `exclude(...)`, `get(...)`, `select_related(...)`, and
   `prefetch_related(...)`
+- `DJ001` warnings for missing `select_related()` or `prefetch_related()` across QuerySet loops,
+  comprehensions, collected QuerySets, related managers, and helper calls, available through both
+  the LSP and `django-lsp check`
+- bounded cross-module call summaries, custom QuerySet chains, collection wrappers, typed model
+  parameters, and typed QuerySet-returning functions
+- Django admin display-method awareness, including eager loading declared by `get_queryset()`
+- Django 6.1 `FETCH_PEERS` and `RAISE` fetch-mode awareness for single-valued relations
 - forward, reverse, and recursive relation traversal
 - `AUTH_USER_MODEL` support
 - models re-exported from package `__init__.py` modules

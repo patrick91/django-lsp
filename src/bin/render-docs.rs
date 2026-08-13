@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 
+use django_lsp::analysis::AnalysisDatabase;
+use django_lsp::config::DjangoLspConfig;
 use django_lsp::server::{Backend, ServerState};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -21,6 +23,8 @@ const MARKDOWN_EXAMPLE_PREFIX: &str = "<!-- django-lsp-example";
 const MARKDOWN_EXAMPLE_END: &str = "-->";
 const MARKDOWN_OUTPUT_START: &str = "<!-- django-lsp-output:start -->";
 const MARKDOWN_OUTPUT_END: &str = "<!-- django-lsp-output:end -->";
+const DIAGNOSTIC_EXAMPLE_PREFIX: &str = "<!-- django-lsp-diagnostic";
+const DIAGNOSTIC_EXAMPLE_END: &str = "<!-- django-lsp-diagnostic:end -->";
 const MDX_EXAMPLE_PREFIX: &str = "{/* django-lsp-example";
 const MDX_EXAMPLE_END: &str = "*/}";
 const MDX_OUTPUT_START: &str = "{/* django-lsp-output:start */}";
@@ -33,6 +37,14 @@ struct ExampleOptions {
     id: String,
     file: PathBuf,
     limit: usize,
+}
+
+#[derive(Debug)]
+struct DiagnosticExampleOptions {
+    file: PathBuf,
+    code: String,
+    method: String,
+    relation_path: String,
 }
 
 #[derive(Debug)]
@@ -135,8 +147,10 @@ async fn render_documents(root: &Path) -> Result<(Vec<RenderedDocument>, Vec<Gen
     let mut documents = Vec::new();
     let mut examples = Vec::new();
     let mut example_ids = HashSet::new();
+    let mut diagnostic_examples = 0usize;
     for path in paths {
         let source = fs::read_to_string(&path)?;
+        diagnostic_examples += validate_diagnostic_examples(root, &path, &source)?;
         let (contents, document_examples) = render_markdown(root, &path, &source).await?;
         if !document_examples.is_empty() {
             for example in &document_examples {
@@ -157,8 +171,145 @@ async fn render_documents(root: &Path) -> Result<(Vec<RenderedDocument>, Vec<Gen
             "no executable Markdown examples found in {DOCS_ROOT}"
         )));
     }
+    if diagnostic_examples == 0 {
+        return Err(message(format!(
+            "no executable diagnostic examples found in {DOCS_ROOT}"
+        )));
+    }
 
     Ok((documents, examples))
+}
+
+fn validate_diagnostic_examples(root: &Path, path: &Path, markdown: &str) -> Result<usize> {
+    let lines = markdown.lines().collect::<Vec<_>>();
+    let mut index = 0usize;
+    let mut count = 0usize;
+    while index < lines.len() {
+        let Some(options) = lines[index].strip_prefix(DIAGNOSTIC_EXAMPLE_PREFIX) else {
+            index += 1;
+            continue;
+        };
+        let options = parse_diagnostic_options(options, path, index + 1)?;
+        index += 1;
+        if !lines
+            .get(index)
+            .is_some_and(|line| line.trim_start().starts_with("```python"))
+        {
+            return Err(message(format!(
+                "{}:{}: diagnostic example must be followed by a Python code fence",
+                path.display(),
+                index + 1
+            )));
+        }
+        index += 1;
+        let source_start = index;
+        while index < lines.len() && !is_closing_fence(lines[index], '`', 3) {
+            index += 1;
+        }
+        if index == lines.len() {
+            return Err(message(format!(
+                "{}:{}: unclosed diagnostic Python fence",
+                path.display(),
+                source_start
+            )));
+        }
+        let source = lines[source_start..index].join("\n");
+        index += 1;
+        if lines.get(index) != Some(&DIAGNOSTIC_EXAMPLE_END) {
+            return Err(message(format!(
+                "{}:{}: diagnostic example must end with `{DIAGNOSTIC_EXAMPLE_END}`",
+                path.display(),
+                index + 1
+            )));
+        }
+        validate_diagnostic_example(root, &options, &source).map_err(|error| {
+            message(format!("{}:{}: {error}", path.display(), source_start + 1))
+        })?;
+        count += 1;
+        index += 1;
+    }
+    Ok(count)
+}
+
+fn parse_diagnostic_options(
+    text: &str,
+    path: &Path,
+    line: usize,
+) -> Result<DiagnosticExampleOptions> {
+    let mut file = None;
+    let mut code = None;
+    let mut method = None;
+    let mut relation_path = None;
+    for option in text.trim_end_matches("-->").split_whitespace() {
+        let (key, value) = option.split_once('=').ok_or_else(|| {
+            message(format!(
+                "{}:{line}: expected diagnostic option in key=value form",
+                path.display()
+            ))
+        })?;
+        match key {
+            "file" => file = Some(PathBuf::from(value)),
+            "code" => code = Some(value.to_string()),
+            "method" => method = Some(value.to_string()),
+            "path" => relation_path = Some(value.to_string()),
+            _ => {
+                return Err(message(format!(
+                    "{}:{line}: unknown diagnostic option `{key}`",
+                    path.display()
+                )));
+            }
+        }
+    }
+    let required = |value: Option<String>, name: &str| {
+        value.ok_or_else(|| {
+            message(format!(
+                "{}:{line}: diagnostic examples require a {name} option",
+                path.display()
+            ))
+        })
+    };
+    Ok(DiagnosticExampleOptions {
+        file: file.ok_or_else(|| {
+            message(format!(
+                "{}:{line}: diagnostic examples require a file option",
+                path.display()
+            ))
+        })?,
+        code: required(code, "code")?,
+        method: required(method, "method")?,
+        relation_path: required(relation_path, "path")?,
+    })
+}
+
+fn validate_diagnostic_example(
+    root: &Path,
+    options: &DiagnosticExampleOptions,
+    source: &str,
+) -> Result<()> {
+    let fixture_root = root.join("tests/fixtures/django_project").canonicalize()?;
+    let document_path = fixture_root.join(&options.file).canonicalize()?;
+    if !document_path.starts_with(&fixture_root) {
+        return Err(message(
+            "diagnostic example file must be inside the Django fixture",
+        ));
+    }
+    let mut database = AnalysisDatabase::build(&fixture_root, DjangoLspConfig::default())?;
+    database.sync_path(document_path.clone(), Some(source.to_string()))?;
+    let diagnostics = database
+        .diagnostics_for_path(&document_path)
+        .ok_or_else(|| message("diagnostic example file was not analyzed"))?;
+    if diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == options.code
+            && diagnostic.method == options.method
+            && diagnostic.relation_path == options.relation_path
+    }) {
+        Ok(())
+    } else {
+        Err(message(format!(
+            "expected {} {}(\"{}\"), got {diagnostics:#?}",
+            options.code, options.method, options.relation_path
+        )))
+    }
 }
 
 fn markdown_paths(root: &Path) -> Result<Vec<PathBuf>> {

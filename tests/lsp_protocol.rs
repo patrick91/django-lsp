@@ -3,9 +3,10 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use django_lsp::server::{Backend, ServerState};
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tower::{Service, ServiceExt};
 use tower_lsp_server::LspService;
@@ -54,7 +55,9 @@ async fn completes_a_django_project_over_json_rpc() {
     let root_uri = file_uri(&root);
     let state = Arc::new(ServerState::default());
     let service_state = state.clone();
-    let (mut service, _socket) = LspService::new(move |client| Backend::new(client, service_state));
+    let (mut service, mut socket) =
+        LspService::new(move |client| Backend::new(client, service_state));
+    tokio::spawn(async move { while socket.next().await.is_some() {} });
 
     let initialize = Request::build("initialize")
         .params(json!({
@@ -81,7 +84,7 @@ async fn completes_a_django_project_over_json_rpc() {
     let did_open = Request::build("textDocument/didOpen")
         .params(json!({
             "textDocument": {
-                "uri": views_uri,
+                "uri": views_uri.clone(),
                 "languageId": "python",
                 "version": 1,
                 "text": views_source,
@@ -201,8 +204,6 @@ async fn completes_a_django_project_over_json_rpc() {
         }))
         .finish();
     assert!(send(&mut service, did_change).await.is_none());
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
     let unsaved_completion = Request::build("textDocument/completion")
         .params(json!({
             "textDocument": {"uri": views_uri},
@@ -218,8 +219,6 @@ async fn completes_a_django_project_over_json_rpc() {
         .params(json!({"textDocument": {"uri": models_uri}}))
         .finish();
     assert!(send(&mut service, did_close).await.is_none());
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
     let reverted_completion = Request::build("textDocument/completion")
         .params(json!({
             "textDocument": {"uri": views_uri},
@@ -246,7 +245,9 @@ async fn benchmarks_real_workspace_responsiveness() {
     let document_uri = file_uri(&document);
     let state = Arc::new(ServerState::default());
     let service_state = state.clone();
-    let (mut service, _socket) = LspService::new(move |client| Backend::new(client, service_state));
+    let (mut service, mut socket) =
+        LspService::new(move |client| Backend::new(client, service_state));
+    tokio::spawn(async move { while socket.next().await.is_some() {} });
 
     let started = Instant::now();
     let initialize = Request::build("initialize")
@@ -308,7 +309,6 @@ async fn benchmarks_real_workspace_responsiveness() {
     assert!(send(&mut service, completion).await.unwrap().is_ok());
     let change_barrier_elapsed = started.elapsed();
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
     eprintln!(
         "initialize_ms={:.2} open_barrier_ms={:.2} change_barrier_ms={:.2}",
         initialize_elapsed.as_secs_f64() * 1_000.0,
@@ -371,6 +371,76 @@ fn serves_framed_json_rpc_over_stdio() {
     let initialize = read_frame(&mut stdout);
     assert_eq!(initialize["id"], 1);
     assert!(initialize["result"]["capabilities"]["completionProvider"].is_object());
+
+    let initialized = json!({"jsonrpc": "2.0", "method": "initialized", "params": {}});
+    stdin.write_all(&frame(&initialized)).unwrap();
+    stdin.flush().unwrap();
+    let log_message = read_frame(&mut stdout);
+    assert_eq!(log_message["method"], "window/logMessage");
+
+    let views_path = fixture_root().join("blog/views.py");
+    let views_uri = file_uri(&views_path);
+    let diagnostic_source = concat!(
+        "from .models import Blog\n",
+        "for blog in Blog.objects.all():\n",
+        "    print(blog.author.email)\n",
+    );
+    let did_open = json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {
+                "uri": views_uri,
+                "languageId": "python",
+                "version": 1,
+                "text": diagnostic_source,
+            }
+        },
+    });
+    stdin.write_all(&frame(&did_open)).unwrap();
+    stdin.flush().unwrap();
+
+    let diagnostics = read_frame(&mut stdout);
+    assert_eq!(diagnostics["method"], "textDocument/publishDiagnostics");
+    assert_eq!(diagnostics["params"]["version"], 1);
+    assert_eq!(diagnostics["params"]["diagnostics"][0]["code"], "DJ001");
+    assert_eq!(
+        diagnostics["params"]["diagnostics"][0]["range"],
+        json!({
+            "start": {"line": 2, "character": 15},
+            "end": {"line": 2, "character": 21},
+        })
+    );
+
+    let fixed_source = diagnostic_source.replace(
+        "Blog.objects.all()",
+        "Blog.objects.select_related(\"author\")",
+    );
+    let did_change = json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+            "textDocument": {"uri": views_uri, "version": 2},
+            "contentChanges": [{"text": fixed_source}],
+        },
+    });
+    stdin.write_all(&frame(&did_change)).unwrap();
+    stdin.flush().unwrap();
+    let diagnostics = read_frame(&mut stdout);
+    assert_eq!(diagnostics["method"], "textDocument/publishDiagnostics");
+    assert_eq!(diagnostics["params"]["version"], 2);
+    assert_eq!(diagnostics["params"]["diagnostics"], json!([]));
+
+    let did_close = json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didClose",
+        "params": {"textDocument": {"uri": views_uri}},
+    });
+    stdin.write_all(&frame(&did_close)).unwrap();
+    stdin.flush().unwrap();
+    let diagnostics = read_frame(&mut stdout);
+    assert_eq!(diagnostics["method"], "textDocument/publishDiagnostics");
+    assert_eq!(diagnostics["params"]["diagnostics"], json!([]));
 
     let shutdown = json!({"jsonrpc": "2.0", "id": 2, "method": "shutdown"});
     stdin.write_all(&frame(&shutdown)).unwrap();

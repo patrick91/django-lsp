@@ -1,31 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
-use ignore::WalkBuilder;
 use ruff_python_ast as ast;
+use ruff_python_ast::visitor::{self, Visitor};
 use ruff_python_ast::{Expr, PySourceType, Stmt};
 use ruff_python_parser::parse_unchecked_source;
 use ruff_text_size::{Ranged, TextSize};
 
 use crate::config::DjangoLspConfig;
-use crate::document_store::DocumentStore;
-use crate::error::{DjangoLspError, Result};
-
-const DEFAULT_EXCLUDES: &[&str] = &[
-    "**/.git/**",
-    "**/node_modules/**",
-    "**/dist/**",
-    "**/build/**",
-    "**/.venv/**",
-    "**/venv/**",
-    "**/site-packages/**",
-    "**/__pycache__/**",
-    "**/migrations/**",
-];
 
 const GENERIC_LOOKUPS: &[&str] = &[
     "exact",
@@ -49,6 +32,14 @@ const DJANGO_MODEL_BASES: &[&str] = &[
     "django.db.models.Model",
     "django.contrib.auth.models.AbstractUser",
     "django.contrib.auth.base_user.AbstractBaseUser",
+    "model_utils.models.StatusModel",
+    "model_utils.models.TimeFramedModel",
+    "model_utils.models.TimeStampedModel",
+    "model_utils.models.UUIDModel",
+    "ordered_model.models.OrderedModel",
+    "wagtail.contrib.settings.models.BaseGenericSetting",
+    "wagtail.contrib.settings.models.BaseSiteSetting",
+    "wagtail.models.Page",
 ];
 const QUERYSET_PRESERVING_METHODS: &[&str] = &[
     "all",
@@ -57,6 +48,7 @@ const QUERYSET_PRESERVING_METHODS: &[&str] = &[
     "order_by",
     "select_related",
     "prefetch_related",
+    "fetch_mode",
     "distinct",
     "only",
     "defer",
@@ -149,6 +141,13 @@ impl ModelInfo {
     pub fn field(&self, name: &str) -> Option<&FieldInfo> {
         self.fields.iter().find(|field| field.name == name)
     }
+
+    pub fn relation_for_accessor(&self, name: &str) -> Option<&FieldInfo> {
+        self.fields.iter().find(|field| {
+            field.related_model.is_some()
+                && field.relation_accessor.as_deref().unwrap_or(&field.name) == name
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,18 +169,98 @@ pub struct ModuleAnalysis {
     pub body: Vec<Stmt>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModuleFacts {
+    path: PathBuf,
+    module_name: String,
+    is_package: bool,
+    imports: HashMap<String, String>,
+    local_class_names: HashSet<String>,
+    raw_classes: Vec<RawClassInfo>,
+    settings: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CallablePath {
+    pub parameter_index: usize,
+    pub segments: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallableSummary {
+    pub qualified_name: String,
+    pub parameters: Vec<String>,
+    pub bound_parameter_count: usize,
+    pub paths: Vec<CallablePath>,
+    pub return_collection_model: Option<String>,
+    pub return_selected: Vec<String>,
+    pub return_prefetched: Vec<String>,
+    pub return_select_all: bool,
+    pub return_selected_unknown: bool,
+    pub return_prefetched_unknown: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CallableFacts {
+    summaries: Vec<RawCallableSummary>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CallableIndex {
+    summaries: HashMap<String, CallableSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawCallableSummary {
+    qualified_name: String,
+    parameters: Vec<String>,
+    bound_parameter_count: usize,
+    return_collection_model: Option<String>,
+    return_loading: QueryLoadingState,
+    paths: Vec<CallablePath>,
+    calls: Vec<SummaryCall>,
+    prefetches: HashMap<usize, SummaryPrefetchState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SummaryCall {
+    target: String,
+    receiver: Option<ParameterOrigin>,
+    positional: Vec<Option<ParameterOrigin>>,
+    keywords: Vec<(String, ParameterOrigin)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParameterOrigin {
+    parameter_index: usize,
+    prefix: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SummaryPrefetchState {
+    paths: HashSet<String>,
+    unknown: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct QueryLoadingState {
+    selected: HashSet<String>,
+    prefetched: HashSet<String>,
+    select_all: bool,
+    selected_unknown: bool,
+    prefetched_unknown: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct WorkspaceIndex {
     root: PathBuf,
-    config: DjangoLspConfig,
-    analyses: HashMap<PathBuf, Arc<ModuleAnalysis>>,
     pub modules: HashMap<PathBuf, ModuleInfo>,
     pub models: HashMap<ModelId, ModelInfo>,
     models_by_class_name: HashMap<String, Vec<ModelId>>,
     settings: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RawClassInfo {
     id: ModelId,
     module_name: String,
@@ -190,7 +269,7 @@ struct RawClassInfo {
     fields: Vec<PendingField>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingField {
     name: String,
     kind: FieldKind,
@@ -199,189 +278,30 @@ struct PendingField {
     reverse_accessor_name: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingRelationTarget {
     Qualified(String),
     StringLiteral(String),
     SettingsKey(String),
 }
 
-#[derive(Debug)]
-struct PathMatcher {
-    root: PathBuf,
-    include: Option<GlobSet>,
-    exclude: GlobSet,
-}
-
-impl PathMatcher {
-    fn new(root: &Path, config: &DjangoLspConfig) -> Result<Self> {
-        let include = if config.include.is_empty() {
-            None
-        } else {
-            Some(build_globset(root, &config.include)?)
-        };
-
-        let mut exclude_patterns = DEFAULT_EXCLUDES
-            .iter()
-            .map(|pattern| pattern.to_string())
-            .collect::<Vec<_>>();
-        exclude_patterns.extend(config.exclude.iter().cloned());
-        let exclude = build_globset(root, &exclude_patterns)?;
-
-        Ok(Self {
-            root: root.to_path_buf(),
-            include,
-            exclude,
-        })
-    }
-
-    fn matches(&self, path: &Path) -> bool {
-        if !path.starts_with(&self.root)
-            || path.extension().and_then(|ext| ext.to_str()) != Some("py")
-        {
-            return false;
-        }
-
-        let relative_path = path
-            .strip_prefix(&self.root)
-            .expect("workspace path was checked above");
-        if self.exclude.is_match(relative_path) {
-            return false;
-        }
-
-        self.include
-            .as_ref()
-            .map(|include| include.is_match(relative_path))
-            .unwrap_or(true)
-    }
-}
-
-fn build_globset(root: &Path, patterns: &[String]) -> Result<GlobSet> {
-    let mut builder = GlobSetBuilder::new();
-    for pattern in patterns {
-        builder.add(
-            Glob::new(pattern).map_err(|source| DjangoLspError::glob(pattern.clone(), source))?,
-        );
-        if !pattern.starts_with("**/") && !pattern.starts_with('.') && !pattern.contains('/') {
-            let scoped = format!("**/{pattern}");
-            builder.add(
-                Glob::new(&scoped)
-                    .map_err(|source| DjangoLspError::glob(scoped.clone(), source))?,
-            );
-        }
-    }
-    let _ = root;
-    builder
-        .build()
-        .map_err(|source| DjangoLspError::glob("globset".to_string(), source))
-}
-
 impl WorkspaceIndex {
-    pub fn build(
-        workspace_root: &Path,
+    pub(crate) fn from_facts(
+        root: PathBuf,
         config: DjangoLspConfig,
-        documents: &DocumentStore,
-    ) -> Result<Self> {
-        let root = config.effective_root(workspace_root);
-        let matcher = PathMatcher::new(&root, &config)?;
-        let mut builder = WalkBuilder::new(&root);
-        builder.hidden(false);
-        builder.git_ignore(true);
-        builder.git_global(true);
-        builder.git_exclude(true);
-        builder.parents(true);
-
-        let mut analyses = HashMap::new();
-
-        for entry in builder.build() {
-            let Ok(entry) = entry else {
-                continue;
-            };
-            let path = entry.path();
-            if !entry
-                .file_type()
-                .is_some_and(|file_type| file_type.is_file())
-                || !matcher.matches(path)
-            {
-                continue;
-            }
-
-            let source = if let Some(snapshot) = documents.get(path) {
-                snapshot.text.clone()
-            } else {
-                match fs::read_to_string(path) {
-                    Ok(contents) => contents,
-                    Err(_) => continue,
-                }
-            };
-
-            analyses.insert(
-                path.to_path_buf(),
-                Arc::new(analyze_source(&root, path, &source)),
-            );
-        }
-
-        let mut index = Self {
-            root,
-            config,
-            analyses,
-            modules: HashMap::new(),
-            models: HashMap::new(),
-            models_by_class_name: HashMap::new(),
-            settings: HashMap::new(),
-        };
-        index.rebuild_derived();
-        Ok(index)
-    }
-
-    pub fn refresh_paths(&mut self, paths: &[PathBuf], documents: &DocumentStore) -> Result<usize> {
-        let matcher = PathMatcher::new(&self.root, &self.config)?;
-        let mut refreshed = 0;
-
-        for path in paths {
-            if !matcher.matches(path) {
-                refreshed += usize::from(self.analyses.remove(path).is_some());
-                continue;
-            }
-
-            let source = documents
-                .get(path)
-                .map(|snapshot| snapshot.text.clone())
-                .or_else(|| fs::read_to_string(path).ok());
-
-            if let Some(source) = source {
-                self.analyses.insert(
-                    path.clone(),
-                    Arc::new(analyze_source(&self.root, path, &source)),
-                );
-                refreshed += 1;
-            } else {
-                refreshed += usize::from(self.analyses.remove(path).is_some());
-            }
-        }
-
-        if refreshed > 0 {
-            self.rebuild_derived();
-        }
-
-        Ok(refreshed)
-    }
-
-    fn rebuild_derived(&mut self) {
+        facts: &[&ModuleFacts],
+    ) -> Self {
         let mut modules = HashMap::new();
         let mut raw_classes = Vec::new();
         let mut settings = HashMap::new();
-        let mut analyses = self.analyses.values().collect::<Vec<_>>();
-        analyses.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        let mut facts = facts.to_vec();
+        facts.sort_unstable_by(|left, right| left.path.cmp(&right.path));
 
-        for analysis in &analyses {
-            if is_settings_module(
-                &analysis.module_name,
-                self.config.settings_module.as_deref(),
-            ) {
-                settings.extend(extract_settings_assignments(&analysis.body));
+        for facts in &facts {
+            if is_settings_module(&facts.module_name, config.settings_module.as_deref()) {
+                settings.extend(facts.settings.clone());
             }
-            raw_classes.extend(extract_raw_classes(analysis));
+            raw_classes.extend(facts.raw_classes.iter().cloned());
         }
 
         let mut model_ids = HashSet::new();
@@ -509,55 +429,38 @@ impl WorkspaceIndex {
             }
         }
 
-        for analysis in analyses {
+        for facts in &facts {
             let mut model_names = HashMap::new();
-            for class_name in &analysis.local_class_names {
-                let model_id = ModelId::new(format!("{}.{}", analysis.module_name, class_name));
+            for class_name in &facts.local_class_names {
+                let model_id = ModelId::new(format!("{}.{}", facts.module_name, class_name));
                 if models.contains_key(&model_id) {
                     model_names.insert(class_name.clone(), model_id);
                 }
             }
 
             modules.insert(
-                analysis.path.clone(),
+                facts.path.clone(),
                 ModuleInfo {
-                    path: analysis.path.clone(),
-                    module_name: analysis.module_name.clone(),
-                    is_package: analysis.is_package,
-                    imports: analysis.imports.clone(),
+                    path: facts.path.clone(),
+                    module_name: facts.module_name.clone(),
+                    is_package: facts.is_package,
+                    imports: facts.imports.clone(),
                     model_names,
                 },
             );
         }
 
-        self.modules = modules;
-        self.models = models;
-        self.models_by_class_name = models_by_class_name;
-        self.settings = settings;
-    }
-
-    pub fn empty(root: PathBuf, config: DjangoLspConfig) -> Self {
         Self {
             root,
-            config,
-            analyses: HashMap::new(),
-            modules: HashMap::new(),
-            models: HashMap::new(),
-            models_by_class_name: HashMap::new(),
-            settings: HashMap::new(),
+            modules,
+            models,
+            models_by_class_name,
+            settings,
         }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
-    }
-
-    pub fn config(&self) -> &DjangoLspConfig {
-        &self.config
-    }
-
-    pub fn analyzed_file_count(&self) -> usize {
-        self.analyses.len()
     }
 
     pub fn setting(&self, name: &str) -> Option<&str> {
@@ -651,9 +554,138 @@ impl WorkspaceIndex {
             None
         }
     }
+}
 
-    pub fn analyze_source(&self, path: &Path, source: &str) -> ModuleAnalysis {
-        analyze_source(&self.root, path, source)
+impl CallableIndex {
+    pub(crate) fn from_facts(facts: &[&CallableFacts]) -> Self {
+        const MAX_SUMMARY_DEPTH: usize = 8;
+
+        let raw = facts
+            .iter()
+            .flat_map(|facts| facts.summaries.iter().cloned())
+            .map(|summary| (summary.qualified_name.clone(), summary))
+            .collect::<HashMap<_, _>>();
+        let mut paths = raw
+            .iter()
+            .map(|(name, summary)| {
+                (
+                    name.clone(),
+                    summary.paths.iter().cloned().collect::<HashSet<_>>(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        for _ in 0..MAX_SUMMARY_DEPTH {
+            let snapshot = paths.clone();
+            let mut changed = false;
+            for (caller_name, caller) in &raw {
+                let Some(caller_paths) = paths.get_mut(caller_name) else {
+                    continue;
+                };
+                for call in &caller.calls {
+                    let Some(callee) = raw.get(&call.target) else {
+                        continue;
+                    };
+                    let Some(callee_paths) = snapshot.get(&call.target) else {
+                        continue;
+                    };
+                    for callee_path in callee_paths {
+                        let Some(origin) =
+                            call.parameter_origin(callee, callee_path.parameter_index)
+                        else {
+                            continue;
+                        };
+                        let mut segments = origin.prefix.clone();
+                        segments.extend(callee_path.segments.iter().cloned());
+                        if segments.is_empty() || segments.len() > MAX_SUMMARY_DEPTH {
+                            continue;
+                        }
+                        if caller.prefetch_covers(origin.parameter_index, &segments) {
+                            continue;
+                        }
+                        changed |= caller_paths.insert(CallablePath {
+                            parameter_index: origin.parameter_index,
+                            segments,
+                        });
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let summaries = raw
+            .into_iter()
+            .map(|(name, raw)| {
+                let mut summary_paths = paths
+                    .remove(&name)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                summary_paths.sort();
+                (
+                    name.clone(),
+                    CallableSummary {
+                        qualified_name: name,
+                        parameters: raw.parameters,
+                        bound_parameter_count: raw.bound_parameter_count,
+                        paths: summary_paths,
+                        return_collection_model: raw.return_collection_model,
+                        return_selected: sorted_strings(raw.return_loading.selected),
+                        return_prefetched: sorted_strings(raw.return_loading.prefetched),
+                        return_select_all: raw.return_loading.select_all,
+                        return_selected_unknown: raw.return_loading.selected_unknown,
+                        return_prefetched_unknown: raw.return_loading.prefetched_unknown,
+                    },
+                )
+            })
+            .collect();
+        Self { summaries }
+    }
+
+    pub fn summary(&self, qualified_name: &str) -> Option<&CallableSummary> {
+        self.summaries.get(qualified_name)
+    }
+}
+
+impl RawCallableSummary {
+    fn prefetch_covers(&self, parameter_index: usize, segments: &[String]) -> bool {
+        let Some(prefetch) = self.prefetches.get(&parameter_index) else {
+            return false;
+        };
+        if prefetch.unknown {
+            return true;
+        }
+        let path = segments.join("__");
+        prefetch
+            .paths
+            .iter()
+            .any(|loaded| path == *loaded || path.starts_with(&format!("{loaded}__")))
+    }
+}
+
+impl SummaryCall {
+    fn parameter_origin(
+        &self,
+        callee: &RawCallableSummary,
+        parameter_index: usize,
+    ) -> Option<&ParameterOrigin> {
+        if parameter_index < callee.bound_parameter_count {
+            return (parameter_index == 0)
+                .then_some(self.receiver.as_ref())
+                .flatten();
+        }
+        let positional_index = parameter_index.checked_sub(callee.bound_parameter_count)?;
+        self.positional
+            .get(positional_index)
+            .and_then(Option::as_ref)
+            .or_else(|| {
+                let parameter_name = callee.parameters.get(parameter_index)?;
+                self.keywords
+                    .iter()
+                    .find_map(|(name, origin)| (name == parameter_name).then_some(origin))
+            })
     }
 }
 
@@ -680,6 +712,521 @@ pub fn analyze_source(root: &Path, path: &Path, source: &str) -> ModuleAnalysis 
         local_class_names,
         body: syntax.body.to_vec(),
     }
+}
+
+pub(crate) fn facts_from_analysis(analysis: &ModuleAnalysis) -> ModuleFacts {
+    ModuleFacts {
+        path: analysis.path.clone(),
+        module_name: analysis.module_name.clone(),
+        is_package: analysis.is_package,
+        imports: analysis.imports.clone(),
+        local_class_names: analysis.local_class_names.clone(),
+        raw_classes: extract_raw_classes(analysis),
+        settings: extract_settings_assignments(&analysis.body),
+    }
+}
+
+pub(crate) fn callable_facts_from_analysis(analysis: &ModuleAnalysis) -> CallableFacts {
+    let local_functions = analysis
+        .body
+        .iter()
+        .filter_map(|statement| match statement {
+            Stmt::FunctionDef(function) => Some(function.name.id.to_string()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut summaries = Vec::new();
+    for statement in &analysis.body {
+        match statement {
+            Stmt::FunctionDef(function) => summaries.push(extract_callable_summary(
+                analysis,
+                &local_functions,
+                None,
+                function,
+            )),
+            Stmt::ClassDef(class) => {
+                for statement in &class.body {
+                    if let Stmt::FunctionDef(function) = statement {
+                        summaries.push(extract_callable_summary(
+                            analysis,
+                            &local_functions,
+                            Some(class.name.as_str()),
+                            function,
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    CallableFacts { summaries }
+}
+
+fn extract_callable_summary(
+    analysis: &ModuleAnalysis,
+    local_functions: &HashSet<String>,
+    class_name: Option<&str>,
+    function: &ast::StmtFunctionDef,
+) -> RawCallableSummary {
+    let parameters = function
+        .parameters
+        .iter()
+        .map(|parameter| parameter.name().to_string())
+        .collect::<Vec<_>>();
+    let parameter_indices = parameters
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.clone(), index))
+        .collect();
+    let bound_parameter_count = usize::from(
+        class_name.is_some()
+            && !function.decorator_list.iter().any(|decorator| {
+                qualify_expr(
+                    &decorator.expression,
+                    &analysis.module_name,
+                    &analysis.local_class_names,
+                    &analysis.imports,
+                )
+                .is_some_and(|name| name.rsplit('.').next() == Some("staticmethod"))
+            }),
+    );
+    let mut visitor = CallableSummaryVisitor {
+        module_name: &analysis.module_name,
+        class_name,
+        local_class_names: &analysis.local_class_names,
+        imports: &analysis.imports,
+        local_functions,
+        parameter_indices,
+        paths: HashSet::new(),
+        calls: Vec::new(),
+        prefetches: HashMap::new(),
+    };
+    for statement in &function.body {
+        visitor.visit_stmt(statement);
+    }
+    let mut paths = visitor
+        .paths
+        .into_iter()
+        .filter(|path| {
+            let Some(prefetch) = visitor.prefetches.get(&path.parameter_index) else {
+                return true;
+            };
+            if prefetch.unknown {
+                return false;
+            }
+            let path = path.segments.join("__");
+            !prefetch
+                .paths
+                .iter()
+                .any(|loaded| path == *loaded || path.starts_with(&format!("{loaded}__")))
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    let qualified_name = class_name.map_or_else(
+        || format!("{}.{}", analysis.module_name, function.name.id),
+        |class_name| format!("{}.{class_name}.{}", analysis.module_name, function.name.id),
+    );
+    RawCallableSummary {
+        qualified_name,
+        parameters,
+        bound_parameter_count,
+        return_collection_model: function
+            .returns
+            .as_deref()
+            .and_then(|annotation| collection_annotation_model_name(annotation, analysis)),
+        return_loading: return_query_loading(function),
+        paths,
+        calls: visitor.calls,
+        prefetches: visitor.prefetches,
+    }
+}
+
+fn collection_annotation_model_name(
+    annotation: &Expr,
+    analysis: &ModuleAnalysis,
+) -> Option<String> {
+    match annotation {
+        Expr::BinOp(binary) => collection_annotation_model_name(&binary.left, analysis)
+            .or_else(|| collection_annotation_model_name(&binary.right, analysis)),
+        Expr::Subscript(subscript) => {
+            let wrapper = qualify_expr(
+                &subscript.value,
+                &analysis.module_name,
+                &analysis.local_class_names,
+                &analysis.imports,
+            )?;
+            let wrapper = wrapper.rsplit('.').next()?;
+            if matches!(wrapper, "Optional" | "Union" | "Annotated") {
+                return collection_annotation_model_name(&subscript.slice, analysis);
+            }
+            if !matches!(wrapper, "QuerySet" | "Manager" | "BaseManager") {
+                return None;
+            }
+            let item = match subscript.slice.as_ref() {
+                Expr::Tuple(tuple) => tuple.elts.first()?,
+                item => item,
+            };
+            qualify_expr(
+                item,
+                &analysis.module_name,
+                &analysis.local_class_names,
+                &analysis.imports,
+            )
+        }
+        Expr::Tuple(tuple) => tuple
+            .elts
+            .iter()
+            .find_map(|item| collection_annotation_model_name(item, analysis)),
+        _ => None,
+    }
+}
+
+fn return_query_loading(function: &ast::StmtFunctionDef) -> QueryLoadingState {
+    let mut collector = ReturnQueryLoadingCollector { states: Vec::new() };
+    for statement in &function.body {
+        collector.visit_stmt(statement);
+    }
+    let mut states = collector.states.into_iter();
+    let Some(mut merged) = states.next() else {
+        return QueryLoadingState::default();
+    };
+    for state in states {
+        match (merged.select_all, state.select_all) {
+            (true, false) => {
+                merged.selected = state.selected;
+                merged.select_all = false;
+            }
+            (false, false) => merged.selected.retain(|path| state.selected.contains(path)),
+            _ => {}
+        }
+        merged
+            .prefetched
+            .retain(|path| state.prefetched.contains(path));
+        merged.selected_unknown |= state.selected_unknown;
+        merged.prefetched_unknown |= state.prefetched_unknown;
+    }
+    merged
+}
+
+struct ReturnQueryLoadingCollector {
+    states: Vec<QueryLoadingState>,
+}
+
+impl Visitor<'_> for ReturnQueryLoadingCollector {
+    fn visit_stmt(&mut self, statement: &Stmt) {
+        match statement {
+            Stmt::Return(return_statement) => {
+                let mut state = QueryLoadingState::default();
+                if let Some(value) = &return_statement.value {
+                    QueryLoadingVisitor { state: &mut state }.visit_expr(value);
+                }
+                self.states.push(state);
+            }
+            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+            _ => visitor::walk_stmt(self, statement),
+        }
+    }
+}
+
+struct QueryLoadingVisitor<'a> {
+    state: &'a mut QueryLoadingState,
+}
+
+impl Visitor<'_> for QueryLoadingVisitor<'_> {
+    fn visit_expr(&mut self, expression: &Expr) {
+        if let Expr::Call(call) = expression
+            && let Expr::Attribute(method) = call.func.as_ref()
+        {
+            match method.attr.as_str() {
+                "select_related" => {
+                    if call.arguments.args.is_empty() {
+                        self.state.select_all = true;
+                    } else if call
+                        .arguments
+                        .args
+                        .first()
+                        .is_some_and(|argument| matches!(argument, Expr::NoneLiteral(_)))
+                    {
+                        self.state.selected.clear();
+                        self.state.select_all = false;
+                        self.state.selected_unknown = false;
+                    } else {
+                        let (paths, unknown) = query_loading_paths(call);
+                        self.state.selected.extend(paths);
+                        self.state.selected_unknown |= unknown;
+                    }
+                }
+                "prefetch_related" => {
+                    if call.arguments.args.len() == 1
+                        && call
+                            .arguments
+                            .args
+                            .first()
+                            .is_some_and(|argument| matches!(argument, Expr::NoneLiteral(_)))
+                    {
+                        self.state.prefetched.clear();
+                        self.state.prefetched_unknown = false;
+                    } else {
+                        let (paths, unknown) = query_loading_paths(call);
+                        self.state.prefetched.extend(paths);
+                        self.state.prefetched_unknown |= unknown;
+                    }
+                }
+                _ => {}
+            }
+        }
+        visitor::walk_expr(self, expression);
+    }
+}
+
+fn query_loading_paths(call: &ast::ExprCall) -> (Vec<String>, bool) {
+    let mut unknown = !call.arguments.keywords.is_empty();
+    let paths = call
+        .arguments
+        .args
+        .iter()
+        .filter_map(|argument| {
+            let path = match argument {
+                Expr::StringLiteral(literal) => Some(literal.value.to_str().to_string()),
+                Expr::Call(prefetch) => {
+                    let is_prefetch = match prefetch.func.as_ref() {
+                        Expr::Name(name) => name.id.as_str() == "Prefetch",
+                        Expr::Attribute(attribute) => attribute.attr.as_str() == "Prefetch",
+                        _ => false,
+                    };
+                    is_prefetch
+                        .then(|| prefetch.arguments.args.first())
+                        .flatten()
+                        .and_then(|argument| match argument {
+                            Expr::StringLiteral(literal) => {
+                                Some(literal.value.to_str().to_string())
+                            }
+                            _ => None,
+                        })
+                }
+                _ => None,
+            };
+            unknown |= path.is_none();
+            path
+        })
+        .collect();
+    (paths, unknown)
+}
+
+fn sorted_strings(values: HashSet<String>) -> Vec<String> {
+    let mut values = values.into_iter().collect::<Vec<_>>();
+    values.sort();
+    values
+}
+
+struct CallableSummaryVisitor<'a> {
+    module_name: &'a str,
+    class_name: Option<&'a str>,
+    local_class_names: &'a HashSet<String>,
+    imports: &'a HashMap<String, String>,
+    local_functions: &'a HashSet<String>,
+    parameter_indices: HashMap<String, usize>,
+    paths: HashSet<CallablePath>,
+    calls: Vec<SummaryCall>,
+    prefetches: HashMap<usize, SummaryPrefetchState>,
+}
+
+impl Visitor<'_> for CallableSummaryVisitor<'_> {
+    fn visit_stmt(&mut self, statement: &Stmt) {
+        if matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+            return;
+        }
+        visitor::walk_stmt(self, statement);
+    }
+
+    fn visit_expr(&mut self, expression: &Expr) {
+        if let Expr::Call(call) = expression
+            && let Expr::Attribute(method) = call.func.as_ref()
+            && relation_write_method(method.attr.as_str())
+        {
+            for argument in &call.arguments.args {
+                self.visit_expr(argument);
+            }
+            for keyword in &call.arguments.keywords {
+                self.visit_expr(&keyword.value);
+            }
+            return;
+        }
+        if let Some(origin) = parameter_origin(expression, &self.parameter_indices)
+            && !origin.prefix.is_empty()
+        {
+            if origin
+                .prefix
+                .last()
+                .is_some_and(|segment| relation_write_method(segment))
+            {
+                return;
+            }
+            self.paths.insert(CallablePath {
+                parameter_index: origin.parameter_index,
+                segments: origin.prefix,
+            });
+            return;
+        }
+
+        if let Expr::Call(call) = expression {
+            self.record_prefetch_related_objects(call);
+            let receiver = match call.func.as_ref() {
+                Expr::Attribute(method) => parameter_origin(&method.value, &self.parameter_indices),
+                _ => None,
+            };
+            let same_class_target = match (call.func.as_ref(), self.class_name) {
+                (Expr::Attribute(method), Some(class_name)) if matches!(method.value.as_ref(), Expr::Name(name) if matches!(name.id.as_str(), "self" | "cls")) => {
+                    Some(format!("{}.{class_name}.{}", self.module_name, method.attr))
+                }
+                _ => None,
+            };
+            let target = same_class_target.or_else(|| {
+                qualify_expr(
+                    &call.func,
+                    self.module_name,
+                    self.local_class_names,
+                    self.imports,
+                )
+                .map(|target| {
+                    if !target.contains('.') && self.local_functions.contains(&target) {
+                        format!("{}.{}", self.module_name, target)
+                    } else {
+                        target
+                    }
+                })
+            });
+            if let Some(target) = target {
+                let positional = call
+                    .arguments
+                    .args
+                    .iter()
+                    .map(|argument| parameter_origin(argument, &self.parameter_indices))
+                    .collect();
+                let keywords = call
+                    .arguments
+                    .keywords
+                    .iter()
+                    .filter_map(|keyword| {
+                        Some((
+                            keyword.arg.as_ref()?.to_string(),
+                            parameter_origin(&keyword.value, &self.parameter_indices)?,
+                        ))
+                    })
+                    .collect();
+                self.calls.push(SummaryCall {
+                    target,
+                    receiver,
+                    positional,
+                    keywords,
+                });
+            }
+        }
+
+        visitor::walk_expr(self, expression);
+    }
+}
+
+impl CallableSummaryVisitor<'_> {
+    fn record_prefetch_related_objects(&mut self, call: &ast::ExprCall) {
+        let Some(target) = qualify_expr(
+            &call.func,
+            self.module_name,
+            self.local_class_names,
+            self.imports,
+        ) else {
+            return;
+        };
+        if !matches!(
+            target.as_str(),
+            "django.db.models.prefetch_related_objects"
+                | "django.db.models.query.prefetch_related_objects"
+        ) {
+            return;
+        }
+        let Some(objects) = call.arguments.args.first() else {
+            return;
+        };
+        let object_expressions: &[Expr] = match objects {
+            Expr::List(list) => &list.elts,
+            Expr::Tuple(tuple) => &tuple.elts,
+            Expr::Set(set) => &set.elts,
+            expression => std::slice::from_ref(expression),
+        };
+        let parameter_indices = object_expressions
+            .iter()
+            .filter_map(|expression| {
+                let origin = parameter_origin(expression, &self.parameter_indices)?;
+                origin.prefix.is_empty().then_some(origin.parameter_index)
+            })
+            .collect::<Vec<_>>();
+        if parameter_indices.is_empty() {
+            return;
+        }
+
+        let mut paths = Vec::new();
+        let mut unknown = !call.arguments.keywords.is_empty();
+        for argument in call.arguments.args.iter().skip(1) {
+            if let Expr::StringLiteral(literal) = argument {
+                paths.push(literal.value.to_str().to_string());
+            } else {
+                unknown = true;
+            }
+        }
+        for parameter_index in parameter_indices {
+            let state = self.prefetches.entry(parameter_index).or_default();
+            state.paths.extend(paths.iter().cloned());
+            state.unknown |= unknown;
+        }
+    }
+}
+
+fn parameter_origin(
+    expression: &Expr,
+    parameter_indices: &HashMap<String, usize>,
+) -> Option<ParameterOrigin> {
+    let mut current = expression;
+    let mut prefix = Vec::new();
+    while let Expr::Attribute(attribute) = current {
+        prefix.push(attribute.attr.to_string());
+        current = &attribute.value;
+    }
+    let Expr::Name(root) = current else {
+        return None;
+    };
+    prefix.reverse();
+    Some(ParameterOrigin {
+        parameter_index: *parameter_indices.get(root.id.as_str())?,
+        prefix,
+    })
+}
+
+fn relation_write_method(method: &str) -> bool {
+    matches!(
+        method,
+        "create"
+            | "acreate"
+            | "get_or_create"
+            | "aget_or_create"
+            | "update_or_create"
+            | "aupdate_or_create"
+            | "add"
+            | "aadd"
+            | "remove"
+            | "aremove"
+            | "clear"
+            | "aclear"
+            | "set"
+            | "aset"
+            | "update"
+            | "aupdate"
+            | "delete"
+            | "adelete"
+            | "bulk_create"
+            | "abulk_create"
+            | "bulk_update"
+            | "abulk_update"
+    )
 }
 
 fn module_name_from_path(root: &Path, path: &Path) -> String {
@@ -725,7 +1272,7 @@ fn collect_imports(module_name: &str, is_package: bool, body: &[Stmt]) -> HashMa
     imports
 }
 
-fn apply_import_statement(
+pub(crate) fn apply_import_statement(
     statement: &Stmt,
     module_name: &str,
     is_package: bool,
@@ -1446,16 +1993,26 @@ fn collect_scope_from_statement(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::ops::Deref;
     use std::path::Path;
-    use std::sync::Arc;
 
     use tempfile::tempdir;
 
     use super::*;
-    use crate::document_store::DocumentStore;
+    use crate::analysis::AnalysisDatabase;
 
-    fn build_index(root: &Path) -> WorkspaceIndex {
-        WorkspaceIndex::build(root, DjangoLspConfig::default(), &DocumentStore::default()).unwrap()
+    struct TestIndex(AnalysisDatabase);
+
+    impl Deref for TestIndex {
+        type Target = WorkspaceIndex;
+
+        fn deref(&self) -> &Self::Target {
+            self.0.index()
+        }
+    }
+
+    fn build_index(root: &Path) -> TestIndex {
+        TestIndex(AnalysisDatabase::build(root, DjangoLspConfig::default()).unwrap())
     }
 
     #[test]
@@ -1536,7 +2093,7 @@ from .models import Blog as Post
     }
 
     #[test]
-    fn refreshes_only_changed_file_analysis_and_restores_disk_contents() {
+    fn updates_changed_file_analysis_and_restores_disk_contents() {
         let dir = tempdir().unwrap();
         let app_dir = dir.path().join("blog");
         let models_path = app_dir.join("models.py");
@@ -1551,30 +2108,18 @@ from .models import Blog as Post
         fs::write(&views_path, "from .models import Blog\n").unwrap();
 
         let mut index = build_index(dir.path());
-        let models_before = Arc::clone(index.analyses.get(&models_path).unwrap());
-        let views_before = Arc::clone(index.analyses.get(&views_path).unwrap());
-        let mut documents = DocumentStore::default();
-        documents.open(
-            models_path.clone(),
-            1,
-            "from django.db import models\nclass Blog(models.Model):\n    title = models.CharField()\n    summary = models.TextField()\n"
-                .to_string(),
-        );
-
-        assert_eq!(
+        assert!(
             index
-                .refresh_paths(std::slice::from_ref(&models_path), &documents)
-                .unwrap(),
-            1
+                .0
+                .sync_path(
+                    models_path.clone(),
+                    Some(
+                        "from django.db import models\nclass Blog(models.Model):\n    title = models.CharField()\n    summary = models.TextField()\n"
+                            .to_string(),
+                    ),
+                )
+                .unwrap()
         );
-        assert!(!Arc::ptr_eq(
-            &models_before,
-            index.analyses.get(&models_path).unwrap()
-        ));
-        assert!(Arc::ptr_eq(
-            &views_before,
-            index.analyses.get(&views_path).unwrap()
-        ));
         assert!(
             index
                 .model(&ModelId::new("blog.models.Blog"))
@@ -1583,13 +2128,7 @@ from .models import Blog as Post
                 .is_some()
         );
 
-        documents.close(&models_path);
-        assert_eq!(
-            index
-                .refresh_paths(std::slice::from_ref(&models_path), &documents)
-                .unwrap(),
-            1
-        );
+        assert!(index.0.sync_path_from_disk(models_path).unwrap());
         assert!(
             index
                 .model(&ModelId::new("blog.models.Blog"))
@@ -1618,6 +2157,54 @@ class Blog(django.db.models.Model):
         let index = build_index(dir.path());
         let blog = index.model(&ModelId::new("blog.models.Blog")).unwrap();
         assert!(blog.field("title").is_some());
+    }
+
+    #[test]
+    fn detects_models_from_common_third_party_abstract_bases() {
+        let dir = tempdir().unwrap();
+        let app_dir = dir.path().join("blog");
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::write(
+            app_dir.join("models.py"),
+            r#"
+from django.db import models
+from model_utils.models import TimeStampedModel
+from ordered_model.models import OrderedModel
+from wagtail.models import Page
+
+class Post(TimeStampedModel, OrderedModel):
+    author = models.ForeignKey("Author", on_delete=models.CASCADE)
+
+class Author(TimeStampedModel):
+    name = models.CharField(max_length=64)
+
+class ContentPage(Page):
+    featured_post = models.ForeignKey(Post, on_delete=models.CASCADE)
+"#,
+        )
+        .unwrap();
+
+        let index = build_index(dir.path());
+        for model in ["Post", "Author", "ContentPage"] {
+            assert!(
+                index
+                    .model(&ModelId::new(format!("blog.models.{model}")))
+                    .is_some(),
+                "expected {model} to be indexed"
+            );
+        }
+        assert_eq!(
+            index
+                .model(&ModelId::new("blog.models.Post"))
+                .unwrap()
+                .field("author")
+                .unwrap()
+                .related_model
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "blog.models.Author"
+        );
     }
 
     #[test]
@@ -1745,7 +2332,7 @@ class OtherUser(AbstractUser):
             settings_module: Some("project.production".to_string()),
             ..DjangoLspConfig::default()
         };
-        let index = WorkspaceIndex::build(dir.path(), config, &DocumentStore::default()).unwrap();
+        let index = TestIndex(AnalysisDatabase::build(dir.path(), config).unwrap());
 
         assert_eq!(
             index.setting("AUTH_USER_MODEL"),
