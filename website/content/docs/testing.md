@@ -28,7 +28,8 @@ exit statuses.
 `tests/lsp_protocol.rs` uses the project in `tests/fixtures/django_project` and exercises two paths:
 
 - an in-process JSON-RPC service covering initialization, document open/change/close events,
-  completion requests, and unsaved model changes
+  completion requests, pull diagnostics for open documents and the full workspace, and unsaved
+  model changes
 - the compiled `django-lsp` executable using real `Content-Length` framing over standard input and
   output, including editor-visible `publishDiagnostics` notifications
 

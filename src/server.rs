@@ -1,14 +1,23 @@
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::Mutex;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
-    CompletionOptions, CompletionResponse, Diagnostic, DiagnosticSeverity,
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    CompletionOptions, CompletionResponse, Diagnostic, DiagnosticOptions,
+    DiagnosticServerCapabilities, DiagnosticSeverity, DidChangeTextDocumentParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentDiagnosticParams,
+    DocumentDiagnosticReport, DocumentDiagnosticReportResult, FullDocumentDiagnosticReport,
     InitializeParams, InitializeResult, InitializedParams, MessageType, NumberOrString, Position,
-    Range, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
+    Range, RelatedFullDocumentDiagnosticReport, RelatedUnchangedDocumentDiagnosticReport,
+    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
+    UnchangedDocumentDiagnosticReport, Uri, WorkspaceDiagnosticParams, WorkspaceDiagnosticReport,
+    WorkspaceDiagnosticReportResult, WorkspaceDocumentDiagnosticReport,
+    WorkspaceFullDocumentDiagnosticReport, WorkspaceUnchangedDocumentDiagnosticReport,
 };
 use tower_lsp_server::{Client, LanguageServer};
 use tracing::{info, warn};
@@ -16,6 +25,7 @@ use tracing::{info, warn};
 use crate::analysis::AnalysisDatabase;
 use crate::completion::complete_lsp_items_from_analysis;
 use crate::config::DjangoLspConfig;
+use crate::diagnostic::OrmDiagnostic;
 use crate::error::DjangoLspError;
 
 #[derive(Debug)]
@@ -34,6 +44,8 @@ struct ServerSnapshot {
     workspace_root: Option<PathBuf>,
     config: DjangoLspConfig,
     database: AnalysisDatabase,
+    uses_pull_diagnostics: bool,
+    supports_diagnostic_refresh: bool,
 }
 
 impl Backend {
@@ -45,43 +57,33 @@ impl Backend {
         &self,
         path: PathBuf,
         contents: Option<String>,
-        uri: tower_lsp_server::ls_types::Uri,
+        uri: Uri,
         version: i32,
+        refresh_workspace: bool,
     ) {
-        let result = {
+        let (result, uses_pull_diagnostics, supports_diagnostic_refresh) = {
             let mut snapshot = self.state.inner.lock().await;
-            snapshot
+            let result = snapshot
                 .database
                 .sync_path(path.clone(), contents)
-                .map(|_| {
-                    let source = snapshot.database.source_for_path(&path).unwrap_or_default();
-                    snapshot.database.diagnostics_for_path(&path).map_or_else(
-                        Vec::new,
-                        |diagnostics| {
-                            diagnostics
-                                .iter()
-                                .map(|diagnostic| Diagnostic {
-                                    range: offsets_to_range(
-                                        source,
-                                        diagnostic.range.start().to_usize(),
-                                        diagnostic.range.end().to_usize(),
-                                    ),
-                                    severity: Some(DiagnosticSeverity::WARNING),
-                                    code: Some(NumberOrString::String(diagnostic.code.to_string())),
-                                    source: Some("django-lsp".to_string()),
-                                    message: diagnostic.message.clone(),
-                                    ..Diagnostic::default()
-                                })
-                                .collect()
-                        },
-                    )
-                })
+                .map(|_| lsp_diagnostics_for_path(&snapshot.database, &path).unwrap_or_default());
+            (
+                result,
+                snapshot.uses_pull_diagnostics,
+                snapshot.supports_diagnostic_refresh,
+            )
         };
         match result {
             Ok(diagnostics) => {
-                self.client
-                    .publish_diagnostics(uri, diagnostics, Some(version))
-                    .await;
+                if uses_pull_diagnostics {
+                    if refresh_workspace && supports_diagnostic_refresh {
+                        self.refresh_workspace_diagnostics().await;
+                    }
+                } else {
+                    self.client
+                        .publish_diagnostics(uri, diagnostics, Some(version))
+                        .await;
+                }
             }
             Err(error) => {
                 warn!("analysis input update failed: {error}");
@@ -95,14 +97,16 @@ impl Backend {
         }
     }
 
-    async fn restore_document_from_disk(&self, path: PathBuf) {
-        let result = self
-            .state
-            .inner
-            .lock()
-            .await
-            .database
-            .sync_path_from_disk(path);
+    async fn restore_document_from_disk(&self, path: PathBuf, uri: Uri) {
+        let (result, uses_pull_diagnostics, supports_diagnostic_refresh) = {
+            let mut snapshot = self.state.inner.lock().await;
+            let result = snapshot.database.sync_path_from_disk(path);
+            (
+                result,
+                snapshot.uses_pull_diagnostics,
+                snapshot.supports_diagnostic_refresh,
+            )
+        };
         if let Err(error) = result {
             warn!("analysis input restore failed: {error}");
             self.client
@@ -111,6 +115,20 @@ impl Backend {
                     format!("django-lsp failed to restore its analysis inputs: {error}"),
                 )
                 .await;
+        }
+
+        if uses_pull_diagnostics {
+            if supports_diagnostic_refresh {
+                self.refresh_workspace_diagnostics().await;
+            }
+        } else {
+            self.client.publish_diagnostics(uri, Vec::new(), None).await;
+        }
+    }
+
+    async fn refresh_workspace_diagnostics(&self) {
+        if let Err(error) = self.client.workspace_diagnostic_refresh().await {
+            warn!("workspace diagnostic refresh failed: {error}");
         }
     }
 
@@ -131,9 +149,7 @@ impl Backend {
             })
     }
 
-    fn path_from_uri(
-        uri: &tower_lsp_server::ls_types::Uri,
-    ) -> std::result::Result<PathBuf, DjangoLspError> {
+    fn path_from_uri(uri: &Uri) -> std::result::Result<PathBuf, DjangoLspError> {
         uri.to_file_path()
             .map(|path| path.into_owned())
             .ok_or_else(|| DjangoLspError::InvalidFileUri(uri.to_string()))
@@ -143,6 +159,19 @@ impl Backend {
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         let workspace_root = Self::workspace_root_from_initialize(&params);
+        let uses_pull_diagnostics = params
+            .capabilities
+            .text_document
+            .as_ref()
+            .and_then(|capabilities| capabilities.diagnostic.as_ref())
+            .is_some();
+        let supports_diagnostic_refresh = params
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|capabilities| capabilities.diagnostics.as_ref())
+            .and_then(|capabilities| capabilities.refresh_support)
+            .unwrap_or(false);
         let config = if let Some(workspace_root) = &workspace_root {
             DjangoLspConfig::load(workspace_root).unwrap_or_default()
         } else {
@@ -177,6 +206,8 @@ impl LanguageServer for Backend {
         snapshot.workspace_root = workspace_root;
         snapshot.config = config;
         snapshot.database = database;
+        snapshot.uses_pull_diagnostics = uses_pull_diagnostics;
+        snapshot.supports_diagnostic_refresh = supports_diagnostic_refresh;
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -191,6 +222,14 @@ impl LanguageServer for Backend {
                     ]),
                     ..CompletionOptions::default()
                 }),
+                diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
+                    DiagnosticOptions {
+                        identifier: Some("django-lsp".to_string()),
+                        inter_file_dependencies: true,
+                        workspace_diagnostics: true,
+                        ..DiagnosticOptions::default()
+                    },
+                )),
                 ..ServerCapabilities::default()
             },
             ..InitializeResult::default()
@@ -213,7 +252,7 @@ impl LanguageServer for Backend {
             return;
         };
         let text = params.text_document.text;
-        self.sync_document(path, Some(text), uri, params.text_document.version)
+        self.sync_document(path, Some(text), uri, params.text_document.version, false)
             .await;
     }
 
@@ -226,8 +265,14 @@ impl LanguageServer for Backend {
             return;
         };
 
-        self.sync_document(path, Some(change.text), uri, params.text_document.version)
-            .await;
+        self.sync_document(
+            path,
+            Some(change.text),
+            uri,
+            params.text_document.version,
+            true,
+        )
+        .await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -236,8 +281,111 @@ impl LanguageServer for Backend {
             return;
         };
 
-        self.restore_document_from_disk(path).await;
-        self.client.publish_diagnostics(uri, Vec::new(), None).await;
+        self.restore_document_from_disk(path, uri).await;
+    }
+
+    async fn diagnostic(
+        &self,
+        params: DocumentDiagnosticParams,
+    ) -> Result<DocumentDiagnosticReportResult> {
+        let Ok(path) = Self::path_from_uri(&params.text_document.uri) else {
+            return Ok(full_document_diagnostic_report(Vec::new(), None).into());
+        };
+        let snapshot = self.state.inner.lock().await;
+        let Some((diagnostics, result_id)) =
+            diagnostics_and_result_id_for_path(&snapshot.database, &path)
+        else {
+            return Ok(full_document_diagnostic_report(Vec::new(), None).into());
+        };
+
+        if let (Some(result_id), Some(previous_result_id)) =
+            (&result_id, &params.previous_result_id)
+            && result_id == previous_result_id
+        {
+            return Ok(DocumentDiagnosticReport::Unchanged(
+                RelatedUnchangedDocumentDiagnosticReport {
+                    related_documents: None,
+                    unchanged_document_diagnostic_report: UnchangedDocumentDiagnosticReport {
+                        result_id: result_id.clone(),
+                    },
+                },
+            )
+            .into());
+        }
+
+        Ok(full_document_diagnostic_report(diagnostics, result_id).into())
+    }
+
+    async fn workspace_diagnostic(
+        &self,
+        params: WorkspaceDiagnosticParams,
+    ) -> Result<WorkspaceDiagnosticReportResult> {
+        let mut previous_result_ids = params
+            .previous_result_ids
+            .into_iter()
+            .map(|previous| (previous.uri, previous.value))
+            .collect::<HashMap<_, _>>();
+        let snapshot = self.state.inner.lock().await;
+        let mut items = Vec::new();
+
+        for path in snapshot.database.paths() {
+            let Some(uri) = Uri::from_file_path(&path) else {
+                warn!(
+                    "could not convert diagnostic path to URI: {}",
+                    path.display()
+                );
+                continue;
+            };
+            let Some((diagnostics, result_id)) =
+                diagnostics_and_result_id_for_path(&snapshot.database, &path)
+            else {
+                continue;
+            };
+            let previous_result_id = previous_result_ids.remove(&uri);
+
+            if diagnostics.is_empty() {
+                if previous_result_id.is_some() {
+                    items.push(workspace_full_document_diagnostic_report(
+                        uri,
+                        Vec::new(),
+                        None,
+                    ));
+                }
+                continue;
+            }
+
+            if let (Some(result_id), Some(previous_result_id)) = (&result_id, &previous_result_id)
+                && result_id == previous_result_id
+            {
+                items.push(WorkspaceDocumentDiagnosticReport::Unchanged(
+                    WorkspaceUnchangedDocumentDiagnosticReport {
+                        uri,
+                        version: None,
+                        unchanged_document_diagnostic_report: UnchangedDocumentDiagnosticReport {
+                            result_id: result_id.clone(),
+                        },
+                    },
+                ));
+            } else {
+                items.push(workspace_full_document_diagnostic_report(
+                    uri,
+                    diagnostics,
+                    result_id,
+                ));
+            }
+        }
+
+        let mut removed_documents = previous_result_ids.into_keys().collect::<Vec<_>>();
+        removed_documents.sort();
+        items.extend(
+            removed_documents
+                .into_iter()
+                .map(|uri| workspace_full_document_diagnostic_report(uri, Vec::new(), None)),
+        );
+
+        Ok(WorkspaceDiagnosticReportResult::Report(
+            WorkspaceDiagnosticReport { items },
+        ))
     }
 
     async fn completion(
@@ -264,6 +412,80 @@ impl LanguageServer for Backend {
             Ok(Some(CompletionResponse::Array(items)))
         }
     }
+}
+
+fn lsp_diagnostics_for_path(database: &AnalysisDatabase, path: &Path) -> Option<Vec<Diagnostic>> {
+    diagnostics_and_result_id_for_path(database, path).map(|(diagnostics, _)| diagnostics)
+}
+
+fn diagnostics_and_result_id_for_path(
+    database: &AnalysisDatabase,
+    path: &Path,
+) -> Option<(Vec<Diagnostic>, Option<String>)> {
+    let source = database.source_for_path(path)?;
+    let diagnostics = database.diagnostics_for_path(path)?;
+    let result_id = diagnostic_result_id(diagnostics);
+    let diagnostics = diagnostics
+        .iter()
+        .map(|diagnostic| Diagnostic {
+            range: offsets_to_range(
+                source,
+                diagnostic.range.start().to_usize(),
+                diagnostic.range.end().to_usize(),
+            ),
+            severity: Some(DiagnosticSeverity::WARNING),
+            code: Some(NumberOrString::String(diagnostic.code.to_string())),
+            source: Some("django-lsp".to_string()),
+            message: diagnostic.message.clone(),
+            ..Diagnostic::default()
+        })
+        .collect();
+    Some((diagnostics, result_id))
+}
+
+fn diagnostic_result_id(diagnostics: &[OrmDiagnostic]) -> Option<String> {
+    if diagnostics.is_empty() {
+        return None;
+    }
+
+    let mut hasher = DefaultHasher::new();
+    for diagnostic in diagnostics {
+        diagnostic.code.hash(&mut hasher);
+        diagnostic.range.start().to_usize().hash(&mut hasher);
+        diagnostic.range.end().to_usize().hash(&mut hasher);
+        diagnostic.message.hash(&mut hasher);
+        diagnostic.method.hash(&mut hasher);
+        diagnostic.relation_path.hash(&mut hasher);
+    }
+    Some(format!("{:016x}", hasher.finish()))
+}
+
+fn full_document_diagnostic_report(
+    diagnostics: Vec<Diagnostic>,
+    result_id: Option<String>,
+) -> DocumentDiagnosticReport {
+    DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
+        related_documents: None,
+        full_document_diagnostic_report: FullDocumentDiagnosticReport {
+            result_id,
+            items: diagnostics,
+        },
+    })
+}
+
+fn workspace_full_document_diagnostic_report(
+    uri: Uri,
+    diagnostics: Vec<Diagnostic>,
+    result_id: Option<String>,
+) -> WorkspaceDocumentDiagnosticReport {
+    WorkspaceDocumentDiagnosticReport::Full(WorkspaceFullDocumentDiagnosticReport {
+        uri,
+        version: None,
+        full_document_diagnostic_report: FullDocumentDiagnosticReport {
+            result_id,
+            items: diagnostics,
+        },
+    })
 }
 
 fn position_to_offset(source: &str, position: Position) -> usize {
