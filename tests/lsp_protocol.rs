@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use django_lsp::server::{Backend, ServerState};
 use futures_util::StreamExt;
@@ -73,6 +73,14 @@ async fn completes_a_django_project_over_json_rpc() {
     assert_eq!(
         response.result().unwrap()["capabilities"]["completionProvider"]["triggerCharacters"],
         json!(["_", "\"", "'"])
+    );
+    assert_eq!(
+        response.result().unwrap()["capabilities"]["diagnosticProvider"],
+        json!({
+            "identifier": "django-lsp",
+            "interFileDependencies": true,
+            "workspaceDiagnostics": true,
+        })
     );
 
     let initialized = Request::build("initialized").params(json!({})).finish();
@@ -228,6 +236,180 @@ async fn completes_a_django_project_over_json_rpc() {
         .finish();
     let response = send(&mut service, reverted_completion).await.unwrap();
     assert_eq!(response.result(), Some(&Value::Null));
+}
+
+#[tokio::test]
+async fn pulls_diagnostics_for_unopened_workspace_documents() {
+    let directory = tempfile::tempdir().unwrap();
+    let blog = directory.path().join("blog");
+    fs::create_dir(&blog).unwrap();
+    fs::write(blog.join("__init__.py"), "").unwrap();
+    fs::write(
+        blog.join("models.py"),
+        concat!(
+            "from django.db import models\n",
+            "\n",
+            "class Author(models.Model):\n",
+            "    email = models.EmailField()\n",
+            "\n",
+            "class Blog(models.Model):\n",
+            "    author = models.ForeignKey(Author, on_delete=models.CASCADE)\n",
+        ),
+    )
+    .unwrap();
+    let diagnostic_source = concat!(
+        "from .models import Blog\n",
+        "\n",
+        "for blog in Blog.objects.all():\n",
+        "    print(blog.author.email)\n",
+    );
+    let first_path = blog.join("first.py");
+    let second_path = blog.join("second.py");
+    fs::write(&first_path, diagnostic_source).unwrap();
+    fs::write(&second_path, diagnostic_source).unwrap();
+
+    let root_uri = file_uri(directory.path());
+    let first_uri = file_uri(&first_path);
+    let second_uri = file_uri(&second_path);
+    let state = Arc::new(ServerState::default());
+    let service_state = state.clone();
+    let (mut service, mut socket) =
+        LspService::new(move |client| Backend::new(client, service_state));
+
+    let initialize = Request::build("initialize")
+        .params(json!({
+            "processId": null,
+            "rootUri": root_uri,
+            "capabilities": {
+                "textDocument": {"diagnostic": {}},
+                "workspace": {"diagnostics": {"refreshSupport": false}},
+            },
+        }))
+        .id(1)
+        .finish();
+    let response = send(&mut service, initialize).await.unwrap();
+    assert!(response.is_ok());
+
+    let initialized = Request::build("initialized").params(json!({})).finish();
+    assert!(send(&mut service, initialized).await.is_none());
+    let log_message = socket.next().await.unwrap();
+    assert_eq!(log_message.method(), "window/logMessage");
+
+    let workspace_diagnostic = Request::build("workspace/diagnostic")
+        .params(json!({
+            "identifier": "django-lsp",
+            "previousResultIds": [],
+            "partialResultToken": "workspace/diagnostic/django-lsp/1",
+        }))
+        .id(2)
+        .finish();
+    let response = send(&mut service, workspace_diagnostic).await.unwrap();
+    let items = response.result().unwrap()["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item["uri"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [&first_uri, &second_uri]
+    );
+    for item in items {
+        assert_eq!(item["kind"], "full");
+        assert_eq!(item["items"][0]["code"], "DJ001");
+        assert!(item["resultId"].is_string());
+    }
+
+    let document_diagnostic = Request::build("textDocument/diagnostic")
+        .params(json!({
+            "textDocument": {"uri": first_uri},
+            "identifier": "django-lsp",
+            "previousResultId": null,
+        }))
+        .id(3)
+        .finish();
+    let response = send(&mut service, document_diagnostic).await.unwrap();
+    assert_eq!(response.result().unwrap()["kind"], "full");
+    assert_eq!(response.result().unwrap()["items"][0]["code"], "DJ001");
+    let document_result_id = response.result().unwrap()["resultId"].clone();
+
+    let document_diagnostic = Request::build("textDocument/diagnostic")
+        .params(json!({
+            "textDocument": {"uri": first_uri},
+            "identifier": "django-lsp",
+            "previousResultId": document_result_id,
+        }))
+        .id(4)
+        .finish();
+    let response = send(&mut service, document_diagnostic).await.unwrap();
+    assert_eq!(response.result().unwrap()["kind"], "unchanged");
+
+    let previous_result_ids = items
+        .iter()
+        .map(|item| {
+            json!({
+                "uri": item["uri"],
+                "value": item["resultId"],
+            })
+        })
+        .collect::<Vec<_>>();
+    let workspace_diagnostic = Request::build("workspace/diagnostic")
+        .params(json!({
+            "identifier": "django-lsp",
+            "previousResultIds": previous_result_ids,
+        }))
+        .id(5)
+        .finish();
+    let response = send(&mut service, workspace_diagnostic).await.unwrap();
+    let items = response.result().unwrap()["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().all(|item| item["kind"] == "unchanged"));
+
+    let fixed_source = diagnostic_source.replace(
+        "Blog.objects.all()",
+        "Blog.objects.select_related(\"author\")",
+    );
+    let did_open = Request::build("textDocument/didOpen")
+        .params(json!({
+            "textDocument": {
+                "uri": first_uri,
+                "languageId": "python",
+                "version": 1,
+                "text": fixed_source,
+            }
+        }))
+        .finish();
+    assert!(send(&mut service, did_open).await.is_none());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), socket.next())
+            .await
+            .is_err(),
+        "pull-capable clients should not also receive pushed diagnostics"
+    );
+
+    let previous_result_ids = items
+        .iter()
+        .map(|item| {
+            json!({
+                "uri": item["uri"],
+                "value": item["resultId"],
+            })
+        })
+        .collect::<Vec<_>>();
+    let workspace_diagnostic = Request::build("workspace/diagnostic")
+        .params(json!({
+            "identifier": "django-lsp",
+            "previousResultIds": previous_result_ids,
+        }))
+        .id(6)
+        .finish();
+    let response = send(&mut service, workspace_diagnostic).await.unwrap();
+    let items = response.result().unwrap()["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    let fixed = items.iter().find(|item| item["uri"] == first_uri).unwrap();
+    assert_eq!(fixed["kind"], "full");
+    assert_eq!(fixed["items"], json!([]));
+    let unchanged = items.iter().find(|item| item["uri"] == second_uri).unwrap();
+    assert_eq!(unchanged["kind"], "unchanged");
 }
 
 #[tokio::test]

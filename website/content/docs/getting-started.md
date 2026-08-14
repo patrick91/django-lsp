@@ -115,6 +115,11 @@ Blog.objects.filter(author__te)
 
 The completion list should include paths such as `author__team`.
 
+Zed requests diagnostics for the whole workspace when the language server starts. Open the project
+diagnostics view with `Cmd-Shift-M` on macOS or `Ctrl-Shift-M` on Linux and Windows to see `DJ001`
+warnings from Python files that have not been opened yet. Opening or editing a file keeps its
+diagnostics current through the document diagnostic request.
+
 ## Find repeated relation queries
 
 The editor also warns when a relation access inside a QuerySet loop can issue one additional query

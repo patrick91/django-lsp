@@ -26,7 +26,8 @@ django-lsp --version
 ```
 
 Point an editor's LSP client at the `django-lsp` command, with no arguments. The server uses standard
-input and output for LSP communication.
+input and output for LSP communication. Editors supporting LSP 3.17 pull diagnostics receive
+`DJ001` warnings for both open documents and unopened files across the workspace.
 
 Run the same repeated-query analysis from a terminal with:
 
