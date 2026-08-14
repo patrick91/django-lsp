@@ -159,10 +159,33 @@ Run the exact same analysis without an editor from the project root:
 ```console
 django-lsp check
 django-lsp check blog/views.py
+django-lsp check --format json
+django-lsp check --format github
 ```
 
-The command prints `path:line:column` warnings and exits with status 1 when it finds diagnostics,
-which makes it suitable for local checks and CI.
+The default text format prints `path:line:column` warnings. JSON provides stable structured fields
+for other tools, while the GitHub format emits native workflow annotations. Exit status 0 means no
+diagnostics, 1 means warnings were found, and 2 means the command or analysis failed.
+
+Each JSON finding contains `path`, one-based `line` and `column` positions, its ending position,
+`severity`, `code`, `message`, and a `suggestion` with the eager-loading method and relation. A
+minimal GitHub Actions step can annotate a pull request directly:
+
+```yaml
+- name: Check Django ORM queries
+  run: uvx django-lsp check --format github
+```
+
+An intentional warning can be suppressed on its reported line without disabling analysis for the
+rest of the file:
+
+```python
+for blog in Blog.objects.all():
+    audit(blog.author.email)  # django-lsp: ignore[DJ001]
+```
+
+For broader path exclusions, including a production-only rollout that skips tests, use
+[configuration](/docs/configuration/).
 
 ## Next steps
 

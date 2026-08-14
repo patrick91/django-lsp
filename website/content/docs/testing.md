@@ -20,7 +20,8 @@ cargo test --all-targets
 
 Unit tests cover indexing, import resolution, relation traversal, completion ranking, repeated-query
 analysis, configuration, and LSP position conversion. `tests/cli_check.rs` verifies the checker's
-human-readable output and exit statuses.
+human-readable, JSON, and GitHub Actions output, inline suppressions, configured exclusions, and
+exit statuses.
 
 ## Protocol tests
 

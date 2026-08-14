@@ -3,10 +3,11 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use ruff_python_ast as ast;
+use ruff_python_ast::token::TokenKind;
 use ruff_python_ast::visitor::{self, Visitor};
 use ruff_python_ast::{Expr, PySourceType, Stmt};
 use ruff_python_parser::parse_unchecked_source;
-use ruff_text_size::{Ranged, TextSize};
+use ruff_text_size::{Ranged, TextRange, TextSize};
 
 use crate::config::DjangoLspConfig;
 
@@ -167,6 +168,22 @@ pub struct ModuleAnalysis {
     pub imports: HashMap<String, String>,
     pub local_class_names: HashSet<String>,
     pub body: Vec<Stmt>,
+    diagnostic_suppressions: Vec<DiagnosticSuppression>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiagnosticSuppression {
+    line: TextRange,
+    codes: Vec<String>,
+}
+
+impl ModuleAnalysis {
+    pub(crate) fn suppresses_diagnostic(&self, code: &str, offset: TextSize) -> bool {
+        self.diagnostic_suppressions.iter().any(|suppression| {
+            suppression.line.contains(offset)
+                && suppression.codes.iter().any(|ignored| ignored == code)
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -691,6 +708,20 @@ impl SummaryCall {
 
 pub fn analyze_source(root: &Path, path: &Path, source: &str) -> ModuleAnalysis {
     let parsed = parse_unchecked_source(source, PySourceType::from(path));
+    let diagnostic_suppressions = parsed
+        .tokens()
+        .iter()
+        .filter(|token| token.kind() == TokenKind::Comment)
+        .filter_map(|token| {
+            let comment =
+                source.get(token.range().start().to_usize()..token.range().end().to_usize())?;
+            let codes = suppression_codes(comment)?;
+            Some(DiagnosticSuppression {
+                line: source_line_range(source, token.start()),
+                codes,
+            })
+        })
+        .collect();
     let syntax = parsed.syntax().clone();
     let is_package = path.file_name().and_then(|name| name.to_str()) == Some("__init__.py");
     let module_name = module_name_from_path(root, path);
@@ -711,7 +742,35 @@ pub fn analyze_source(root: &Path, path: &Path, source: &str) -> ModuleAnalysis 
         imports,
         local_class_names,
         body: syntax.body.to_vec(),
+        diagnostic_suppressions,
     }
+}
+
+fn suppression_codes(comment: &str) -> Option<Vec<String>> {
+    let directive = comment.strip_prefix('#')?.trim();
+    let codes = directive.strip_prefix("django-lsp: ignore[")?;
+    let (codes, _) = codes.split_once(']')?;
+    let codes = codes
+        .split(',')
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    (!codes.is_empty()).then_some(codes)
+}
+
+fn source_line_range(source: &str, offset: TextSize) -> TextRange {
+    let offset = offset.to_usize();
+    let start = source[..offset]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    let end = source[offset..]
+        .find('\n')
+        .map_or(source.len(), |newline| offset + newline);
+    TextRange::new(
+        TextSize::try_from(start).expect("Python source offsets fit in TextSize"),
+        TextSize::try_from(end).expect("Python source offsets fit in TextSize"),
+    )
 }
 
 pub(crate) fn facts_from_analysis(analysis: &ModuleAnalysis) -> ModuleFacts {

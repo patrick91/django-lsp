@@ -33,7 +33,13 @@ Run the same repeated-query analysis from a terminal with:
 ```console
 django-lsp check
 django-lsp check path/to/views.py
+django-lsp check --format github
 ```
+
+The checker exits with status 0 when no diagnostics are found, 1 when it reports warnings, and 2
+for invalid arguments or analysis failures. Use `--format json` for structured output or
+`--format github` for native GitHub Actions annotations. Suppress an intentional warning on its
+source line with `# django-lsp: ignore[DJ001]`.
 
 ### Visual Studio Code
 
