@@ -142,6 +142,14 @@ for blog in Blog.objects.select_related("author"):
     print(blog.author.email)
 ```
 
+In an editor, place the cursor on the warning and open its code actions. **Add
+`select_related("author")`** applies the same change to the local QuerySet expression. When one
+QuerySet is missing several relations, **Add all missing related loading for this QuerySet** adds
+the required `select_related()` and `prefetch_related()` calls together. django-lsp only offers
+these edits when it can trace the warning to an exact QuerySet expression in the current file;
+diagnostics discovered through an external helper or a Django admin display method remain
+advisory.
+
 The same analysis covers list, set, dictionary, and generator comprehensions; QuerySets collected
 with `list()`, `tuple()`, or `set()`; custom QuerySet methods; typed model parameters; and typed
 QuerySet return values. A collection parameter alone is not treated as a database query because its

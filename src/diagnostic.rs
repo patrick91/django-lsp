@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use ruff_python_ast::visitor::{self, Visitor};
 use ruff_python_ast::{self as ast, Expr, Stmt};
-use ruff_text_size::{Ranged, TextRange};
+use ruff_text_size::{Ranged, TextRange, TextSize};
 
 use crate::index::{
     CallableIndex, CallableSummary, ModelId, ModuleAnalysis, RelationDirection, WorkspaceIndex,
@@ -18,6 +18,12 @@ pub struct OrmDiagnostic {
     pub message: String,
     pub method: &'static str,
     pub relation_path: String,
+    pub fix_target: Option<QueryFixTarget>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct QueryFixTarget {
+    pub append_offset: TextSize,
 }
 
 struct PendingDiagnostic {
@@ -53,6 +59,7 @@ struct QueryState {
     loading: LoadingState,
     local_loading: Option<LoadingState>,
     iteration_range: Option<TextRange>,
+    fix_target: Option<QueryFixTarget>,
 }
 
 impl QueryState {
@@ -65,7 +72,13 @@ impl QueryState {
             loading: LoadingState::default(),
             local_loading: None,
             iteration_range: None,
+            fix_target: None,
         }
+    }
+
+    fn with_fix_target(mut self, append_offset: TextSize) -> Self {
+        self.fix_target = Some(QueryFixTarget { append_offset });
+        self
     }
 
     fn compose_relation_path(&self, relation_path: String, all_selectable: bool) -> (String, bool) {
@@ -507,6 +520,7 @@ impl Analyzer<'_> {
                 ),
                 method,
                 relation_path,
+                fix_target: query.fix_target,
             },
             iteration_range,
         });
@@ -665,7 +679,7 @@ impl Analyzer<'_> {
             }
             Expr::Attribute(attribute) if attribute.attr.as_str() == "objects" => {
                 let model = self.resolve_model_reference(&attribute.value, scope)?;
-                Some(QueryState::new(model))
+                Some(QueryState::new(model).with_fix_target(attribute.range.end()))
             }
             Expr::Attribute(_) => self.resolve_related_manager(expression, scope),
             Expr::Call(call) => {
@@ -703,6 +717,7 @@ impl Analyzer<'_> {
                 let mut query = self
                     .resolve_query_state(&method.value, scope)
                     .or_else(|| self.resolve_related_manager(&method.value, scope))?;
+                let update_fix_target = !matches!(method.attr.as_str(), "iterator" | "aiterator");
                 match method.attr.as_str() {
                     "all" | "filter" | "exclude" | "order_by" | "distinct" | "only" | "defer"
                     | "annotate" | "iterator" | "aiterator" => {}
@@ -753,6 +768,14 @@ impl Analyzer<'_> {
                     }
                     method if queryset_method_returns_model_instances(method) => {}
                     _ => return None,
+                }
+                if update_fix_target
+                    && query.fix_target.is_some()
+                    && query.relation_prefix.is_empty()
+                {
+                    query.fix_target = Some(QueryFixTarget {
+                        append_offset: call.range.end(),
+                    });
                 }
                 Some(query)
             }
@@ -826,7 +849,8 @@ impl Analyzer<'_> {
                 return query;
             }
 
-            let mut query = QueryState::new(model.id.clone());
+            let mut query =
+                QueryState::new(model.id.clone()).with_fix_target(expression.range().end());
             let prefix = format!("{}__", manager_path.join("__"));
             query.loading.prefetched.extend(
                 root_state
@@ -1359,8 +1383,10 @@ emails = [author.blogs.count() for author in Author.objects.all()]
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].relation_path, "author__team");
         assert_eq!(result[0].method, "select_related");
+        assert!(result[0].fix_target.is_some());
         assert_eq!(result[1].relation_path, "blogs");
         assert_eq!(result[1].method, "prefetch_related");
+        assert!(result[1].fix_target.is_some());
     }
 
     #[test]
@@ -1454,6 +1480,7 @@ for blog in Blog.objects.all():
 
         assert_eq!(result.len(), 1, "{result:#?}");
         assert_eq!(result[0].relation_path, "author");
+        assert!(result[0].fix_target.is_some());
     }
 
     #[test]
@@ -1586,6 +1613,7 @@ for row in Blog.objects.values("author"):
 
         assert_eq!(result.len(), 1, "{result:#?}");
         assert_eq!(result[0].relation_path, "author");
+        assert!(result[0].fix_target.is_some());
     }
 
     #[test]
@@ -1777,6 +1805,8 @@ for keynote in Keynote.objects.all():
             source_for_range(source, result[0].range),
             "Keynote.objects.all()"
         );
+        let fix_offset = result[0].fix_target.unwrap().append_offset.to_usize();
+        assert!(source[..fix_offset].ends_with("Keynote.objects.all()"));
     }
 
     fn source_for_range(source: &str, range: TextRange) -> &str {
@@ -1852,6 +1882,7 @@ class BlogAdmin(admin.ModelAdmin):
 
         assert_eq!(result.len(), 1, "{result:#?}");
         assert_eq!(result[0].relation_path, "author");
+        assert!(result[0].fix_target.is_none());
     }
 
     #[test]
@@ -1880,6 +1911,7 @@ for blog in ready_blogs():
 
         assert_eq!(result.len(), 1, "{result:#?}");
         assert_eq!(result[0].relation_path, "author");
+        assert!(result[0].fix_target.is_none());
     }
 
     #[test]

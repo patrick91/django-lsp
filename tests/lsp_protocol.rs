@@ -69,6 +69,10 @@ async fn completes_a_django_project_over_json_rpc() {
         .finish();
     let response = send(&mut service, initialize).await.unwrap();
     assert!(response.is_ok());
+    assert_eq!(
+        response.result().unwrap()["capabilities"]["codeActionProvider"],
+        json!({"codeActionKinds": ["quickfix"]})
+    );
     assert!(response.result().unwrap()["capabilities"]["completionProvider"].is_object());
     assert_eq!(
         response.result().unwrap()["capabilities"]["completionProvider"]["triggerCharacters"],
@@ -254,6 +258,7 @@ async fn pulls_diagnostics_for_unopened_workspace_documents() {
             "\n",
             "class Blog(models.Model):\n",
             "    author = models.ForeignKey(Author, on_delete=models.CASCADE)\n",
+            "    editor = models.ForeignKey(Author, on_delete=models.CASCADE, related_name=\"edited_blogs\")\n",
         ),
     )
     .unwrap();
@@ -261,7 +266,7 @@ async fn pulls_diagnostics_for_unopened_workspace_documents() {
         "from .models import Blog\n",
         "\n",
         "for blog in Blog.objects.all():\n",
-        "    print(blog.author.email)\n",
+        "    print(blog.author.email, blog.editor.email)\n",
     );
     let first_path = blog.join("first.py");
     let second_path = blog.join("second.py");
@@ -330,7 +335,48 @@ async fn pulls_diagnostics_for_unopened_workspace_documents() {
     let response = send(&mut service, document_diagnostic).await.unwrap();
     assert_eq!(response.result().unwrap()["kind"], "full");
     assert_eq!(response.result().unwrap()["items"][0]["code"], "DJ001");
+    assert_eq!(
+        response.result().unwrap()["items"][0]["data"],
+        json!({
+            "method": "select_related",
+            "relation": "author",
+            "fixable": true,
+        })
+    );
+    let diagnostic = response.result().unwrap()["items"][0].clone();
     let document_result_id = response.result().unwrap()["resultId"].clone();
+
+    let code_action = Request::build("textDocument/codeAction")
+        .params(json!({
+            "textDocument": {"uri": first_uri},
+            "range": diagnostic["range"],
+            "context": {"diagnostics": [diagnostic]},
+        }))
+        .id(4)
+        .finish();
+    let response = send(&mut service, code_action).await.unwrap();
+    let actions = response.result().unwrap().as_array().unwrap();
+    assert_eq!(actions.len(), 2);
+    assert_eq!(actions[0]["title"], "Add select_related(\"author\")");
+    assert_eq!(actions[0]["kind"], "quickfix");
+    assert_eq!(actions[0]["isPreferred"], true);
+    assert_eq!(
+        actions[0]["edit"]["changes"][&first_uri][0]["newText"],
+        ".select_related(\"author\")"
+    );
+    assert_eq!(
+        actions[0]["edit"]["changes"][&first_uri][0]["range"]["start"],
+        position_after(diagnostic_source, "Blog.objects.all()")
+    );
+    assert_eq!(
+        actions[1]["title"],
+        "Add all missing related loading for this QuerySet"
+    );
+    assert_eq!(
+        actions[1]["edit"]["changes"][&first_uri][0]["newText"],
+        ".select_related(\"author\", \"editor\")"
+    );
+    assert_eq!(actions[1]["diagnostics"].as_array().unwrap().len(), 2);
 
     let document_diagnostic = Request::build("textDocument/diagnostic")
         .params(json!({
@@ -338,7 +384,7 @@ async fn pulls_diagnostics_for_unopened_workspace_documents() {
             "identifier": "django-lsp",
             "previousResultId": document_result_id,
         }))
-        .id(4)
+        .id(5)
         .finish();
     let response = send(&mut service, document_diagnostic).await.unwrap();
     assert_eq!(response.result().unwrap()["kind"], "unchanged");
@@ -357,7 +403,7 @@ async fn pulls_diagnostics_for_unopened_workspace_documents() {
             "identifier": "django-lsp",
             "previousResultIds": previous_result_ids,
         }))
-        .id(5)
+        .id(6)
         .finish();
     let response = send(&mut service, workspace_diagnostic).await.unwrap();
     let items = response.result().unwrap()["items"].as_array().unwrap();
@@ -366,7 +412,7 @@ async fn pulls_diagnostics_for_unopened_workspace_documents() {
 
     let fixed_source = diagnostic_source.replace(
         "Blog.objects.all()",
-        "Blog.objects.select_related(\"author\")",
+        "Blog.objects.select_related(\"author\", \"editor\")",
     );
     let did_open = Request::build("textDocument/didOpen")
         .params(json!({
@@ -400,7 +446,7 @@ async fn pulls_diagnostics_for_unopened_workspace_documents() {
             "identifier": "django-lsp",
             "previousResultIds": previous_result_ids,
         }))
-        .id(6)
+        .id(7)
         .finish();
     let response = send(&mut service, workspace_diagnostic).await.unwrap();
     let items = response.result().unwrap()["items"].as_array().unwrap();

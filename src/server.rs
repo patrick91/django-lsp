@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -8,16 +8,18 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
-    CompletionOptions, CompletionResponse, Diagnostic, DiagnosticOptions,
-    DiagnosticServerCapabilities, DiagnosticSeverity, DidChangeTextDocumentParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentDiagnosticParams,
-    DocumentDiagnosticReport, DocumentDiagnosticReportResult, FullDocumentDiagnosticReport,
-    InitializeParams, InitializeResult, InitializedParams, MessageType, NumberOrString, Position,
-    Range, RelatedFullDocumentDiagnosticReport, RelatedUnchangedDocumentDiagnosticReport,
-    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
-    UnchangedDocumentDiagnosticReport, Uri, WorkspaceDiagnosticParams, WorkspaceDiagnosticReport,
-    WorkspaceDiagnosticReportResult, WorkspaceDocumentDiagnosticReport,
-    WorkspaceFullDocumentDiagnosticReport, WorkspaceUnchangedDocumentDiagnosticReport,
+    CodeAction, CodeActionKind, CodeActionOptions, CodeActionOrCommand, CodeActionParams,
+    CodeActionProviderCapability, CodeActionResponse, CompletionOptions, CompletionResponse,
+    Diagnostic, DiagnosticOptions, DiagnosticServerCapabilities, DiagnosticSeverity,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportResult,
+    FullDocumentDiagnosticReport, InitializeParams, InitializeResult, InitializedParams,
+    MessageType, NumberOrString, Position, Range, RelatedFullDocumentDiagnosticReport,
+    RelatedUnchangedDocumentDiagnosticReport, ServerCapabilities, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextEdit, UnchangedDocumentDiagnosticReport, Uri,
+    WorkspaceDiagnosticParams, WorkspaceDiagnosticReport, WorkspaceDiagnosticReportResult,
+    WorkspaceDocumentDiagnosticReport, WorkspaceEdit, WorkspaceFullDocumentDiagnosticReport,
+    WorkspaceUnchangedDocumentDiagnosticReport,
 };
 use tower_lsp_server::{Client, LanguageServer};
 use tracing::{info, warn};
@@ -230,6 +232,12 @@ impl LanguageServer for Backend {
                         ..DiagnosticOptions::default()
                     },
                 )),
+                code_action_provider: Some(CodeActionProviderCapability::Options(
+                    CodeActionOptions {
+                        code_action_kinds: Some(vec![CodeActionKind::QUICKFIX]),
+                        ..CodeActionOptions::default()
+                    },
+                )),
                 ..ServerCapabilities::default()
             },
             ..InitializeResult::default()
@@ -412,6 +420,114 @@ impl LanguageServer for Backend {
             Ok(Some(CompletionResponse::Array(items)))
         }
     }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        if params.context.only.as_ref().is_some_and(|kinds| {
+            !kinds
+                .iter()
+                .any(|kind| kind.as_str() == CodeActionKind::QUICKFIX.as_str())
+        }) {
+            return Ok(None);
+        }
+
+        let uri = params.text_document.uri;
+        let Ok(path) = Self::path_from_uri(&uri) else {
+            return Ok(None);
+        };
+        let snapshot = self.state.inner.lock().await;
+        let Some(source) = snapshot.database.source_for_path(&path) else {
+            return Ok(None);
+        };
+        let Some(diagnostics) = snapshot.database.diagnostics_for_path(&path) else {
+            return Ok(None);
+        };
+
+        let selected = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.fix_target.is_some())
+            .filter(|diagnostic| {
+                let range = offsets_to_range(
+                    source,
+                    diagnostic.range.start().to_usize(),
+                    diagnostic.range.end().to_usize(),
+                );
+                params.context.diagnostics.iter().any(|candidate| {
+                    candidate.range == range
+                        && candidate.code.as_ref()
+                            == Some(&NumberOrString::String(diagnostic.code.to_string()))
+                })
+            })
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            return Ok(None);
+        }
+
+        let mut actions = Vec::new();
+        let mut seen_individual = HashSet::new();
+        let mut seen_groups = HashSet::new();
+        for diagnostic in selected {
+            let target = diagnostic
+                .fix_target
+                .expect("selected diagnostics have fixes");
+            if seen_individual.insert((target, diagnostic.method, diagnostic.relation_path.clone()))
+            {
+                let edit = format!(".{}(\"{}\")", diagnostic.method, diagnostic.relation_path);
+                actions.push(CodeActionOrCommand::CodeAction(code_action_with_edit(
+                    format!(
+                        "Add {}(\"{}\")",
+                        diagnostic.method, diagnostic.relation_path
+                    ),
+                    &uri,
+                    source,
+                    target.append_offset.to_usize(),
+                    edit,
+                    vec![lsp_diagnostic(source, diagnostic)],
+                    true,
+                )));
+            }
+
+            if !seen_groups.insert(target) {
+                continue;
+            }
+            let related = diagnostics
+                .iter()
+                .filter(|candidate| candidate.fix_target == Some(target))
+                .collect::<Vec<_>>();
+            if related.len() < 2 {
+                continue;
+            }
+            let mut selected_paths = BTreeSet::new();
+            let mut prefetched_paths = BTreeSet::new();
+            for candidate in &related {
+                match candidate.method {
+                    "select_related" => {
+                        selected_paths.insert(candidate.relation_path.as_str());
+                    }
+                    "prefetch_related" => {
+                        prefetched_paths.insert(candidate.relation_path.as_str());
+                    }
+                    _ => {}
+                }
+            }
+            let mut edit = String::new();
+            append_loading_call(&mut edit, "select_related", &selected_paths);
+            append_loading_call(&mut edit, "prefetch_related", &prefetched_paths);
+            actions.push(CodeActionOrCommand::CodeAction(code_action_with_edit(
+                "Add all missing related loading for this QuerySet".to_string(),
+                &uri,
+                source,
+                target.append_offset.to_usize(),
+                edit,
+                related
+                    .into_iter()
+                    .map(|diagnostic| lsp_diagnostic(source, diagnostic))
+                    .collect(),
+                false,
+            )));
+        }
+
+        Ok((!actions.is_empty()).then_some(actions))
+    }
 }
 
 fn lsp_diagnostics_for_path(database: &AnalysisDatabase, path: &Path) -> Option<Vec<Diagnostic>> {
@@ -427,18 +543,7 @@ fn diagnostics_and_result_id_for_path(
     let result_id = diagnostic_result_id(diagnostics);
     let diagnostics = diagnostics
         .iter()
-        .map(|diagnostic| Diagnostic {
-            range: offsets_to_range(
-                source,
-                diagnostic.range.start().to_usize(),
-                diagnostic.range.end().to_usize(),
-            ),
-            severity: Some(DiagnosticSeverity::WARNING),
-            code: Some(NumberOrString::String(diagnostic.code.to_string())),
-            source: Some("django-lsp".to_string()),
-            message: diagnostic.message.clone(),
-            ..Diagnostic::default()
-        })
+        .map(|diagnostic| lsp_diagnostic(source, diagnostic))
         .collect();
     Some((diagnostics, result_id))
 }
@@ -456,8 +561,72 @@ fn diagnostic_result_id(diagnostics: &[OrmDiagnostic]) -> Option<String> {
         diagnostic.message.hash(&mut hasher);
         diagnostic.method.hash(&mut hasher);
         diagnostic.relation_path.hash(&mut hasher);
+        diagnostic.fix_target.hash(&mut hasher);
     }
     Some(format!("{:016x}", hasher.finish()))
+}
+
+fn lsp_diagnostic(source: &str, diagnostic: &OrmDiagnostic) -> Diagnostic {
+    Diagnostic {
+        range: offsets_to_range(
+            source,
+            diagnostic.range.start().to_usize(),
+            diagnostic.range.end().to_usize(),
+        ),
+        severity: Some(DiagnosticSeverity::WARNING),
+        code: Some(NumberOrString::String(diagnostic.code.to_string())),
+        source: Some("django-lsp".to_string()),
+        message: diagnostic.message.clone(),
+        data: Some(serde_json::json!({
+            "method": diagnostic.method,
+            "relation": diagnostic.relation_path,
+            "fixable": diagnostic.fix_target.is_some(),
+        })),
+        ..Diagnostic::default()
+    }
+}
+
+fn code_action_with_edit(
+    title: String,
+    uri: &Uri,
+    source: &str,
+    offset: usize,
+    new_text: String,
+    diagnostics: Vec<Diagnostic>,
+    preferred: bool,
+) -> CodeAction {
+    let range = offsets_to_range(source, offset, offset);
+    CodeAction {
+        title,
+        kind: Some(CodeActionKind::QUICKFIX),
+        diagnostics: Some(diagnostics),
+        edit: Some(WorkspaceEdit {
+            changes: Some(HashMap::from([(
+                uri.clone(),
+                vec![TextEdit::new(range, new_text)],
+            )])),
+            ..WorkspaceEdit::default()
+        }),
+        is_preferred: Some(preferred),
+        ..CodeAction::default()
+    }
+}
+
+fn append_loading_call(output: &mut String, method: &str, paths: &BTreeSet<&str>) {
+    if paths.is_empty() {
+        return;
+    }
+    output.push('.');
+    output.push_str(method);
+    output.push('(');
+    output.push_str(
+        &paths
+            .iter()
+            .map(|path| format!("\"{path}\""))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    output.push(')');
 }
 
 fn full_document_diagnostic_report(
