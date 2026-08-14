@@ -2,7 +2,7 @@
   "name": "django-lsp",
   "displayName": "Django ORM Language Server",
   "description": "Django ORM completions and repeated-query diagnostics powered by Rust.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "publisher": "patrick91",
   "private": true,
   "license": "SEE LICENSE IN LICENSE",
