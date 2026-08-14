@@ -5,7 +5,7 @@ use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_text_size::{Ranged, TextRange};
 
 use crate::index::{
-    CallableIndex, CallableSummary, ModelId, ModuleAnalysis, WorkspaceIndex,
+    CallableIndex, CallableSummary, ModelId, ModuleAnalysis, RelationDirection, WorkspaceIndex,
     apply_import_statement, qualify_expr,
 };
 
@@ -782,25 +782,47 @@ impl Analyzer<'_> {
         let repeated = scope.repeated_items.get(root);
         let root_state = repeated.or_else(|| scope.model_instances.get(root))?;
         let mut model = self.index.model(&root_state.model)?;
-        let mut relation = None;
+        let mut relation_is_manager = None;
+        let mut relation_direction = None;
+        let mut manager_parent_model = None;
         let mut manager_path = Vec::new();
         let mut manager_all_selectable = true;
         for (segment, _) in segments {
             let field = model.relation_for_accessor(segment)?;
             let related_model = field.related_model.as_ref()?;
-            relation = Some(field);
+            manager_parent_model = Some(model.id.clone());
+            relation_is_manager = Some(!field.supports_select_related());
+            relation_direction = field.relation_direction;
             manager_path.push(segment.to_string());
             manager_all_selectable &= field.supports_select_related();
             model = self.index.model(related_model)?;
         }
-        let relation = relation?;
-        (!relation.supports_select_related()).then(|| {
+        relation_is_manager?.then(|| {
+            let cached_parent_relation = (relation_direction == Some(RelationDirection::Reverse))
+                .then(|| {
+                    let parent = manager_parent_model.as_ref()?;
+                    let mut relations = model.fields.iter().filter(|field| {
+                        field.relation_direction == Some(RelationDirection::Forward)
+                            && field.related_model.as_ref() == Some(parent)
+                    });
+                    let relation = relations.next()?;
+                    relations.next().is_none().then(|| relation.name.clone())
+                })
+                .flatten();
             if repeated.is_some() {
                 let mut query = root_state.clone();
                 query.model = model.id.clone();
                 query.relation_prefix.extend(manager_path);
                 query.prefix_all_selectable &= manager_all_selectable;
                 query.local_loading = Some(LoadingState::default());
+                if let Some(relation) = cached_parent_relation {
+                    query
+                        .local_loading
+                        .as_mut()
+                        .expect("related manager loading state")
+                        .selected
+                        .insert(relation);
+                }
                 return query;
             }
 
@@ -814,6 +836,9 @@ impl Analyzer<'_> {
                     .filter_map(|path| path.strip_prefix(&prefix).map(ToOwned::to_owned)),
             );
             query.loading.prefetched_unknown = root_state.loading.prefetched_unknown;
+            if let Some(relation) = cached_parent_relation {
+                query.loading.selected.insert(relation);
+            }
             query
         })
     }
@@ -1465,6 +1490,24 @@ for author in Author.objects.prefetch_related("blogs"):
         assert_eq!(result.len(), 1, "{result:#?}");
         assert_eq!(result[0].relation_path, "blogs");
         assert_eq!(result[0].method, "prefetch_related");
+    }
+
+    #[test]
+    fn reverse_foreign_key_managers_cache_the_parent_relation() {
+        let result = diagnostics(
+            r#"
+from .models import Conference
+
+def render_grants(conference: Conference):
+    return [grant.conference.name for grant in conference.grants.all()]
+
+for conference in Conference.objects.prefetch_related("grants"):
+    for grant in conference.grants.all():
+        print(grant.conference.name)
+"#,
+        );
+
+        assert!(result.is_empty(), "{result:#?}");
     }
 
     #[test]
