@@ -5,7 +5,7 @@ use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_text_size::{Ranged, TextRange};
 
 use crate::index::{
-    CallableIndex, CallableSummary, ModelId, ModuleAnalysis, WorkspaceIndex,
+    CallableIndex, CallableSummary, ModelId, ModuleAnalysis, RelationDirection, WorkspaceIndex,
     apply_import_statement, qualify_expr,
 };
 
@@ -20,6 +20,11 @@ pub struct OrmDiagnostic {
     pub relation_path: String,
 }
 
+struct PendingDiagnostic {
+    diagnostic: OrmDiagnostic,
+    iteration_range: TextRange,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum FetchMode {
     #[default]
@@ -29,30 +34,58 @@ enum FetchMode {
     Unknown,
 }
 
-#[derive(Debug, Clone)]
-struct QueryState {
-    model: ModelId,
+#[derive(Debug, Clone, Default)]
+struct LoadingState {
     selected: HashSet<String>,
     prefetched: HashSet<String>,
-    iteration_range: Option<TextRange>,
     select_all: bool,
     selected_unknown: bool,
     prefetched_unknown: bool,
     fetch_mode: FetchMode,
 }
 
+#[derive(Debug, Clone)]
+struct QueryState {
+    model: ModelId,
+    root_model: ModelId,
+    relation_prefix: Vec<String>,
+    prefix_all_selectable: bool,
+    loading: LoadingState,
+    local_loading: Option<LoadingState>,
+    iteration_range: Option<TextRange>,
+}
+
 impl QueryState {
     fn new(model: ModelId) -> Self {
         Self {
+            root_model: model.clone(),
             model,
-            selected: HashSet::new(),
-            prefetched: HashSet::new(),
+            relation_prefix: Vec::new(),
+            prefix_all_selectable: true,
+            loading: LoadingState::default(),
+            local_loading: None,
             iteration_range: None,
-            select_all: false,
-            selected_unknown: false,
-            prefetched_unknown: false,
-            fetch_mode: FetchMode::One,
         }
+    }
+
+    fn compose_relation_path(&self, relation_path: String, all_selectable: bool) -> (String, bool) {
+        if self.relation_prefix.is_empty() {
+            return (relation_path, all_selectable);
+        }
+        (
+            format!("{}__{relation_path}", self.relation_prefix.join("__")),
+            self.prefix_all_selectable && all_selectable,
+        )
+    }
+
+    fn local_relation_is_loaded(&self, path: &str, all_selectable: bool) -> bool {
+        self.local_loading
+            .as_ref()
+            .is_some_and(|loading| loading_state_covers(loading, path, all_selectable))
+    }
+
+    fn active_loading_mut(&mut self) -> &mut LoadingState {
+        self.local_loading.as_mut().unwrap_or(&mut self.loading)
     }
 }
 
@@ -85,21 +118,26 @@ pub fn analyze_diagnostics(
             ..Scope::default()
         },
     );
-    analyzer.diagnostics.sort_by_key(|diagnostic| {
+    analyzer.diagnostics.sort_by_key(|pending| {
+        let diagnostic = &pending.diagnostic;
         (
             diagnostic.range.start(),
             diagnostic.range.end(),
             diagnostic.relation_path.clone(),
         )
     });
-    analyzer.diagnostics
+    analyzer
+        .diagnostics
+        .into_iter()
+        .map(|pending| pending.diagnostic)
+        .collect()
 }
 
 struct Analyzer<'a> {
     index: &'a WorkspaceIndex,
     callables: &'a CallableIndex,
     analysis: &'a ModuleAnalysis,
-    diagnostics: Vec<OrmDiagnostic>,
+    diagnostics: Vec<PendingDiagnostic>,
     seen: HashSet<(TextRange, String)>,
 }
 
@@ -310,14 +348,70 @@ impl Analyzer<'_> {
         let Some(query) = scope.repeated_items.get(root) else {
             return false;
         };
+        if self.inspect_property_access(query, &segments) {
+            return true;
+        }
         let Some((relation_path, all_selectable, relation_count)) =
             self.relation_details(&query.model, segments.iter().map(|(segment, _)| *segment))
         else {
             return true;
         };
         let range = segments[relation_count - 1].1;
+        if query.local_relation_is_loaded(&relation_path, all_selectable) {
+            return true;
+        }
+        let (relation_path, all_selectable) =
+            query.compose_relation_path(relation_path, all_selectable);
         self.emit_missing_eager_load(query, relation_path, all_selectable, range);
         true
+    }
+
+    fn inspect_property_access(
+        &mut self,
+        query: &QueryState,
+        segments: &[(&str, TextRange)],
+    ) -> bool {
+        let Some(mut model) = self.index.model(&query.model) else {
+            return false;
+        };
+        let mut prefix = Vec::new();
+        for (segment, range) in segments {
+            if let Some(field) = model.relation_for_accessor(segment)
+                && let Some(related_model) = field
+                    .related_model
+                    .as_ref()
+                    .and_then(|model_id| self.index.model(model_id))
+            {
+                prefix.push(*segment);
+                model = related_model;
+                continue;
+            }
+
+            let Some(summary) = self.callables.property_summary(&model.id, segment) else {
+                return false;
+            };
+            let paths = summary.paths.clone();
+            let mut emitted = false;
+            for path in paths.iter().filter(|path| path.parameter_index == 0) {
+                let mut relation_segments = prefix.clone();
+                relation_segments.extend(path.segments.iter().map(String::as_str));
+                let Some((relation_path, all_selectable, _)) =
+                    self.relation_details(&query.model, relation_segments)
+                else {
+                    continue;
+                };
+                if query.local_relation_is_loaded(&relation_path, all_selectable) {
+                    emitted = true;
+                    continue;
+                }
+                let (relation_path, all_selectable) =
+                    query.compose_relation_path(relation_path, all_selectable);
+                self.emit_missing_eager_load(query, relation_path, all_selectable, *range);
+                emitted = true;
+            }
+            return emitted;
+        }
+        false
     }
 
     fn relation_details<'segment>(
@@ -376,20 +470,45 @@ impl Analyzer<'_> {
         }) {
             return;
         }
+        let parent_paths = self
+            .seen
+            .iter()
+            .filter(|(seen_iteration, seen_path)| {
+                *seen_iteration == iteration_range
+                    && relation_path.starts_with(&format!("{seen_path}__"))
+            })
+            .map(|(_, path)| path.clone())
+            .collect::<HashSet<_>>();
+        if !parent_paths.is_empty() {
+            self.seen.retain(|(seen_iteration, seen_path)| {
+                *seen_iteration != iteration_range || !parent_paths.contains(seen_path)
+            });
+            self.diagnostics.retain(|pending| {
+                pending.iteration_range != iteration_range
+                    || !parent_paths.contains(&pending.diagnostic.relation_path)
+            });
+        }
         if !self.seen.insert((iteration_range, relation_path.clone())) {
             return;
         }
-        self.diagnostics.push(OrmDiagnostic {
-            code: MISSING_EAGER_LOAD,
-            range,
-            message: format!(
-                "Accessing `{relation_path}` for each `{}` may issue an extra query per row; add `{method}(\"{relation_path}\")` to the QuerySet.",
-                self.index
-                    .model(&query.model)
-                    .map_or(query.model.as_str(), |model| model.class_name.as_str())
-            ),
-            method,
-            relation_path,
+        self.diagnostics.push(PendingDiagnostic {
+            diagnostic: OrmDiagnostic {
+                code: MISSING_EAGER_LOAD,
+                range: if query.relation_prefix.is_empty() {
+                    range
+                } else {
+                    iteration_range
+                },
+                message: format!(
+                    "Accessing `{relation_path}` for each `{}` may issue an extra query per row; add `{method}(\"{relation_path}\")` to the QuerySet.",
+                    self.index
+                        .model(&query.root_model)
+                        .map_or(query.root_model.as_str(), |model| model.class_name.as_str())
+                ),
+                method,
+                relation_path,
+            },
+            iteration_range,
         });
     }
 
@@ -422,6 +541,11 @@ impl Analyzer<'_> {
             else {
                 continue;
             };
+            if query.local_relation_is_loaded(&relation_path, all_selectable) {
+                continue;
+            }
+            let (relation_path, all_selectable) =
+                query.compose_relation_path(relation_path, all_selectable);
             self.emit_missing_eager_load(query, relation_path, all_selectable, argument.range());
         }
     }
@@ -493,7 +617,7 @@ impl Analyzer<'_> {
         scope.queries.remove(name.id.as_str());
         scope.model_instances.remove(name.id.as_str());
         if let Some(mut query) = query {
-            query.iteration_range = Some(iteration_range);
+            query.iteration_range.get_or_insert(iteration_range);
             scope.repeated_items.insert(name.id.to_string(), query);
         } else {
             scope.repeated_items.remove(name.id.as_str());
@@ -528,8 +652,9 @@ impl Analyzer<'_> {
             &call.arguments.args[1..],
             !call.arguments.keywords.is_empty(),
         );
-        query.prefetched.extend(paths);
-        query.prefetched_unknown |= unknown;
+        let loading = query.active_loading_mut();
+        loading.prefetched.extend(paths);
+        loading.prefetched_unknown |= unknown;
     }
 
     fn resolve_query_state(&self, expression: &Expr, scope: &Scope) -> Option<QueryState> {
@@ -560,14 +685,16 @@ impl Analyzer<'_> {
                 {
                     let mut query = QueryState::new(model);
                     query
+                        .loading
                         .selected
                         .extend(summary.return_selected.iter().cloned());
                     query
+                        .loading
                         .prefetched
                         .extend(summary.return_prefetched.iter().cloned());
-                    query.select_all = summary.return_select_all;
-                    query.selected_unknown = summary.return_selected_unknown;
-                    query.prefetched_unknown = summary.return_prefetched_unknown;
+                    query.loading.select_all = summary.return_select_all;
+                    query.loading.selected_unknown = summary.return_selected_unknown;
+                    query.loading.prefetched_unknown = summary.return_prefetched_unknown;
                     return Some(query);
                 }
                 let Expr::Attribute(method) = call.func.as_ref() else {
@@ -580,24 +707,26 @@ impl Analyzer<'_> {
                     "all" | "filter" | "exclude" | "order_by" | "distinct" | "only" | "defer"
                     | "annotate" | "iterator" | "aiterator" => {}
                     "select_related" => {
+                        let loading = query.active_loading_mut();
                         if call.arguments.args.is_empty() {
-                            query.select_all = true;
+                            loading.select_all = true;
                         } else if call
                             .arguments
                             .args
                             .first()
                             .is_some_and(|argument| matches!(argument, Expr::NoneLiteral(_)))
                         {
-                            query.selected.clear();
-                            query.select_all = false;
-                            query.selected_unknown = false;
+                            loading.selected.clear();
+                            loading.select_all = false;
+                            loading.selected_unknown = false;
                         } else {
                             let (paths, unknown) = literal_relation_paths(call);
-                            query.selected.extend(paths);
-                            query.selected_unknown |= unknown;
+                            loading.selected.extend(paths);
+                            loading.selected_unknown |= unknown;
                         }
                     }
                     "prefetch_related" => {
+                        let loading = query.active_loading_mut();
                         if call.arguments.args.len() == 1
                             && call
                                 .arguments
@@ -605,21 +734,22 @@ impl Analyzer<'_> {
                                 .first()
                                 .is_some_and(|argument| matches!(argument, Expr::NoneLiteral(_)))
                         {
-                            query.prefetched.clear();
-                            query.prefetched_unknown = false;
+                            loading.prefetched.clear();
+                            loading.prefetched_unknown = false;
                         } else {
                             let (paths, unknown) = literal_relation_paths(call);
-                            query.prefetched.extend(paths);
-                            query.prefetched_unknown |= unknown;
+                            loading.prefetched.extend(paths);
+                            loading.prefetched_unknown |= unknown;
                         }
                     }
                     "fetch_mode" => {
-                        query.fetch_mode = call
+                        let fetch_mode = call
                             .arguments
                             .args
                             .first()
                             .and_then(fetch_mode_from_expression)
                             .unwrap_or(FetchMode::Unknown);
+                        query.active_loading_mut().fetch_mode = fetch_mode;
                     }
                     method if queryset_method_returns_model_instances(method) => {}
                     _ => return None,
@@ -650,29 +780,65 @@ impl Analyzer<'_> {
     fn resolve_related_manager(&self, expression: &Expr, scope: &Scope) -> Option<QueryState> {
         let (root, segments) = attribute_chain(expression)?;
         let repeated = scope.repeated_items.get(root);
-        let instance = scope.model_instances.get(root);
-        let root_state = repeated.or(instance)?;
+        let root_state = repeated.or_else(|| scope.model_instances.get(root))?;
         let mut model = self.index.model(&root_state.model)?;
-        let mut relation = None;
+        let mut relation_is_manager = None;
+        let mut relation_direction = None;
+        let mut manager_parent_model = None;
         let mut manager_path = Vec::new();
+        let mut manager_all_selectable = true;
         for (segment, _) in segments {
             let field = model.relation_for_accessor(segment)?;
             let related_model = field.related_model.as_ref()?;
-            relation = Some(field);
-            manager_path.push(segment);
+            manager_parent_model = Some(model.id.clone());
+            relation_is_manager = Some(!field.supports_select_related());
+            relation_direction = field.relation_direction;
+            manager_path.push(segment.to_string());
+            manager_all_selectable &= field.supports_select_related();
             model = self.index.model(related_model)?;
         }
-        let relation = relation?;
-        (!relation.supports_select_related()).then(|| {
+        relation_is_manager?.then(|| {
+            let cached_parent_relation = (relation_direction == Some(RelationDirection::Reverse))
+                .then(|| {
+                    let parent = manager_parent_model.as_ref()?;
+                    let mut relations = model.fields.iter().filter(|field| {
+                        field.relation_direction == Some(RelationDirection::Forward)
+                            && field.related_model.as_ref() == Some(parent)
+                    });
+                    let relation = relations.next()?;
+                    relations.next().is_none().then(|| relation.name.clone())
+                })
+                .flatten();
+            if repeated.is_some() {
+                let mut query = root_state.clone();
+                query.model = model.id.clone();
+                query.relation_prefix.extend(manager_path);
+                query.prefix_all_selectable &= manager_all_selectable;
+                query.local_loading = Some(LoadingState::default());
+                if let Some(relation) = cached_parent_relation {
+                    query
+                        .local_loading
+                        .as_mut()
+                        .expect("related manager loading state")
+                        .selected
+                        .insert(relation);
+                }
+                return query;
+            }
+
             let mut query = QueryState::new(model.id.clone());
             let prefix = format!("{}__", manager_path.join("__"));
-            query.prefetched.extend(
+            query.loading.prefetched.extend(
                 root_state
+                    .loading
                     .prefetched
                     .iter()
                     .filter_map(|path| path.strip_prefix(&prefix).map(ToOwned::to_owned)),
             );
-            query.prefetched_unknown = root_state.prefetched_unknown;
+            query.loading.prefetched_unknown = root_state.loading.prefetched_unknown;
+            if let Some(relation) = cached_parent_relation {
+                query.loading.selected.insert(relation);
+            }
             query
         })
     }
@@ -819,12 +985,12 @@ impl Visitor<'_> for AdminQuerysetVisitor<'_> {
             let (paths, unknown) = literal_relation_paths(call);
             match method.attr.as_str() {
                 "select_related" => {
-                    self.state.selected.extend(paths);
-                    self.state.selected_unknown |= unknown;
+                    self.state.loading.selected.extend(paths);
+                    self.state.loading.selected_unknown |= unknown;
                 }
                 "prefetch_related" => {
-                    self.state.prefetched.extend(paths);
-                    self.state.prefetched_unknown |= unknown;
+                    self.state.loading.prefetched.extend(paths);
+                    self.state.loading.prefetched_unknown |= unknown;
                 }
                 _ => {}
             }
@@ -1041,15 +1207,19 @@ fn fetch_mode_from_expression(expression: &Expr) -> Option<FetchMode> {
 }
 
 fn relation_is_loaded(query: &QueryState, path: &str, all_selectable: bool) -> bool {
+    loading_state_covers(&query.loading, path, all_selectable)
+}
+
+fn loading_state_covers(loading: &LoadingState, path: &str, all_selectable: bool) -> bool {
     let covers = |loaded: &str| loaded == path || loaded.starts_with(&format!("{path}__"));
-    query.prefetched.iter().any(|loaded| covers(loaded))
-        || query.prefetched_unknown
+    loading.prefetched.iter().any(|loaded| covers(loaded))
+        || loading.prefetched_unknown
         || (all_selectable
-            && (query.select_all
-                || query.selected_unknown
-                || query.selected.iter().any(|loaded| covers(loaded))
+            && (loading.select_all
+                || loading.selected_unknown
+                || loading.selected.iter().any(|loaded| covers(loaded))
                 || matches!(
-                    query.fetch_mode,
+                    loading.fetch_mode,
                     FetchMode::Peers | FetchMode::Raise | FetchMode::Unknown
                 )))
 }
@@ -1076,6 +1246,7 @@ mod tests {
             app.join("models.py"),
             r#"
 from django.db import models
+from django.utils.functional import cached_property
 
 class Team(models.Model):
     name = models.CharField()
@@ -1100,12 +1271,64 @@ class ReviewSession(models.Model):
 class Grant(models.Model):
     conference = models.ForeignKey(Conference, on_delete=models.CASCADE, related_name="grants")
 
+    @property
+    def total_grantee_reimbursement_amount(self):
+        return sum(
+            reimbursement.granted_amount
+            for reimbursement in self.reimbursements.all()
+            if reimbursement.category.name != "ticket"
+        )
+
 class ReimbursementCategory(models.Model):
     name = models.CharField()
 
 class Reimbursement(models.Model):
     grant = models.ForeignKey(Grant, on_delete=models.CASCADE, related_name="reimbursements")
     category = models.ForeignKey(ReimbursementCategory, on_delete=models.CASCADE)
+    granted_amount = models.IntegerField()
+
+class User(models.Model):
+    name = models.CharField()
+
+class Keynote(models.Model):
+    title = models.CharField()
+
+    @property
+    def speaker_names(self):
+        keynote_speakers = [
+            speaker for speaker in self.speakers.all() if speaker.user_id
+        ]
+        return [speaker.user.name for speaker in keynote_speakers]
+
+class KeynoteSpeaker(models.Model):
+    keynote = models.ForeignKey(Keynote, on_delete=models.CASCADE, related_name="speakers")
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+
+class Submission(models.Model):
+    speaker = models.ForeignKey(User, on_delete=models.CASCADE)
+
+class ScheduleItem(models.Model):
+    submission = models.ForeignKey(Submission, on_delete=models.CASCADE, null=True)
+    keynote = models.ForeignKey(Keynote, on_delete=models.CASCADE, null=True)
+
+    @cached_property
+    def speakers(self):
+        speakers = []
+        if self.submission_id:
+            speakers.append(self.submission.speaker)
+        if self.keynote_id:
+            for speaker_keynote in self.keynote.speakers.order_by("id").all():
+                speakers.append(speaker_keynote.user)
+        speakers.extend(
+            [speaker.user for speaker in self.additional_speakers.order_by("id").all()]
+        )
+        return speakers
+
+class ScheduleItemAdditionalSpeaker(models.Model):
+    schedule_item = models.ForeignKey(
+        ScheduleItem, on_delete=models.CASCADE, related_name="additional_speakers"
+    )
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
 "#,
         )
         .unwrap();
@@ -1249,6 +1472,45 @@ for author in Author.objects.prefetch_related("blogs__author"):
     }
 
     #[test]
+    fn preserves_loading_applied_to_the_inner_related_manager_queryset() {
+        let result = diagnostics(
+            r#"
+from .models import Author
+
+for author in Author.objects.all():
+    for blog in author.blogs.select_related("author"):
+        print(blog.author.name)
+
+for author in Author.objects.prefetch_related("blogs"):
+    for blog in author.blogs.select_related("author"):
+        print(blog.author.name)
+"#,
+        );
+
+        assert_eq!(result.len(), 1, "{result:#?}");
+        assert_eq!(result[0].relation_path, "blogs");
+        assert_eq!(result[0].method, "prefetch_related");
+    }
+
+    #[test]
+    fn reverse_foreign_key_managers_cache_the_parent_relation() {
+        let result = diagnostics(
+            r#"
+from .models import Conference
+
+def render_grants(conference: Conference):
+    return [grant.conference.name for grant in conference.grants.all()]
+
+for conference in Conference.objects.prefetch_related("grants"):
+    for grant in conference.grants.all():
+        print(grant.conference.name)
+"#,
+        );
+
+        assert!(result.is_empty(), "{result:#?}");
+    }
+
+    #[test]
     fn resolves_function_local_and_dotted_model_imports() {
         let result = diagnostics(
             r#"
@@ -1282,11 +1544,9 @@ def notify_grants(review_session: ReviewSession):
 "#,
         );
 
-        assert_eq!(result.len(), 2, "{result:#?}");
-        assert_eq!(result[0].relation_path, "reimbursements");
+        assert_eq!(result.len(), 1, "{result:#?}");
+        assert_eq!(result[0].relation_path, "reimbursements__category");
         assert_eq!(result[0].method, "prefetch_related");
-        assert_eq!(result[1].relation_path, "category");
-        assert_eq!(result[1].method, "select_related");
     }
 
     #[test]
@@ -1401,6 +1661,126 @@ for blog in Blog.objects.all():
 
         assert_eq!(result.len(), 1, "{result:#?}");
         assert_eq!(result[0].relation_path, "author__team");
+    }
+
+    #[test]
+    fn pycon_properties_report_nested_paths_at_repeated_call_sites() {
+        let source = r#"
+from .models import Grant, Keynote
+
+for grant in Grant.objects.all():
+    print(grant.total_grantee_reimbursement_amount)
+
+for keynote in Keynote.objects.all():
+    print(keynote.speaker_names)
+"#;
+        let result = diagnostics(source);
+
+        assert_eq!(result.len(), 2, "{result:#?}");
+        assert_eq!(result[0].relation_path, "reimbursements__category");
+        assert_eq!(result[0].method, "prefetch_related");
+        assert_eq!(
+            source_for_range(source, result[0].range),
+            "total_grantee_reimbursement_amount"
+        );
+        assert_eq!(result[1].relation_path, "speakers__user");
+        assert_eq!(result[1].method, "prefetch_related");
+        assert_eq!(source_for_range(source, result[1].range), "speaker_names");
+    }
+
+    #[test]
+    fn pycon_property_paths_respect_existing_nested_prefetches() {
+        let result = diagnostics(
+            r#"
+from .models import Grant, Keynote
+
+for grant in Grant.objects.prefetch_related("reimbursements__category"):
+    print(grant.total_grantee_reimbursement_amount)
+
+for keynote in Keynote.objects.prefetch_related("speakers__user"):
+    print(keynote.speaker_names)
+"#,
+        );
+
+        assert!(result.is_empty(), "{result:#?}");
+    }
+
+    #[test]
+    fn pycon_admin_property_reports_each_missing_eager_load_at_the_display_method() {
+        let source = r#"
+from django.contrib import admin
+from .models import ScheduleItem
+
+@admin.register(ScheduleItem)
+class ScheduleItemAdmin(admin.ModelAdmin):
+    def get_queryset(self, request):
+        return super().get_queryset(request).prefetch_related("rooms")
+
+    def speakers_names(self, obj: ScheduleItem):
+        return ", ".join(speaker.name for speaker in obj.speakers)
+"#;
+        let result = diagnostics(source);
+
+        assert_eq!(
+            result
+                .iter()
+                .map(|diagnostic| diagnostic.relation_path.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "additional_speakers__user",
+                "keynote__speakers__user",
+                "submission__speaker",
+            ],
+            "{result:#?}"
+        );
+        assert!(
+            result
+                .iter()
+                .all(|diagnostic| { source_for_range(source, diagnostic.range) == "speakers" })
+        );
+    }
+
+    #[test]
+    fn nested_related_manager_helpers_report_the_full_outer_path() {
+        let source = r#"
+from .models import Grant
+
+def reimbursement_categories(grant):
+    return [item.category.name for item in grant.reimbursements.all()]
+
+for grant in Grant.objects.all():
+    print(reimbursement_categories(grant))
+"#;
+        let result = diagnostics(source);
+
+        assert_eq!(result.len(), 1, "{result:#?}");
+        assert_eq!(result[0].relation_path, "reimbursements__category");
+        assert_eq!(result[0].method, "prefetch_related");
+        assert_eq!(source_for_range(source, result[0].range), "grant");
+    }
+
+    #[test]
+    fn nested_related_manager_loops_keep_the_outer_queryset_provenance() {
+        let source = r#"
+from .models import Keynote
+
+for keynote in Keynote.objects.all():
+    for speaker in keynote.speakers.all():
+        print(speaker.user.name)
+"#;
+        let result = diagnostics(source);
+
+        assert_eq!(result.len(), 1, "{result:#?}");
+        assert_eq!(result[0].relation_path, "speakers__user");
+        assert_eq!(result[0].method, "prefetch_related");
+        assert_eq!(
+            source_for_range(source, result[0].range),
+            "Keynote.objects.all()"
+        );
+    }
+
+    fn source_for_range(source: &str, range: TextRange) -> &str {
+        &source[range.start().to_usize()..range.end().to_usize()]
     }
 
     #[test]

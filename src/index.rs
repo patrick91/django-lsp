@@ -208,6 +208,7 @@ pub struct CallableSummary {
     pub qualified_name: String,
     pub parameters: Vec<String>,
     pub bound_parameter_count: usize,
+    pub is_property: bool,
     pub paths: Vec<CallablePath>,
     pub return_collection_model: Option<String>,
     pub return_selected: Vec<String>,
@@ -232,6 +233,7 @@ struct RawCallableSummary {
     qualified_name: String,
     parameters: Vec<String>,
     bound_parameter_count: usize,
+    is_property: bool,
     return_collection_model: Option<String>,
     return_loading: QueryLoadingState,
     paths: Vec<CallablePath>,
@@ -641,12 +643,21 @@ impl CallableIndex {
                     .into_iter()
                     .collect::<Vec<_>>();
                 summary_paths.sort();
+                let all_paths = summary_paths.clone();
+                summary_paths.retain(|path| {
+                    !all_paths.iter().any(|candidate| {
+                        candidate.parameter_index == path.parameter_index
+                            && candidate.segments.len() > path.segments.len()
+                            && candidate.segments.starts_with(&path.segments)
+                    })
+                });
                 (
                     name.clone(),
                     CallableSummary {
                         qualified_name: name,
                         parameters: raw.parameters,
                         bound_parameter_count: raw.bound_parameter_count,
+                        is_property: raw.is_property,
                         paths: summary_paths,
                         return_collection_model: raw.return_collection_model,
                         return_selected: sorted_strings(raw.return_loading.selected),
@@ -663,6 +674,11 @@ impl CallableIndex {
 
     pub fn summary(&self, qualified_name: &str) -> Option<&CallableSummary> {
         self.summaries.get(qualified_name)
+    }
+
+    pub fn property_summary(&self, model: &ModelId, property: &str) -> Option<&CallableSummary> {
+        self.summary(&format!("{model}.{property}"))
+            .filter(|summary| summary.is_property)
     }
 }
 
@@ -856,6 +872,8 @@ fn extract_callable_summary(
         imports: &analysis.imports,
         local_functions,
         parameter_indices,
+        bindings: HashMap::new(),
+        collections: HashMap::new(),
         paths: HashSet::new(),
         calls: Vec::new(),
         prefetches: HashMap::new(),
@@ -889,6 +907,20 @@ fn extract_callable_summary(
         qualified_name,
         parameters,
         bound_parameter_count,
+        is_property: function.decorator_list.iter().any(|decorator| {
+            qualify_expr(
+                &decorator.expression,
+                &analysis.module_name,
+                &analysis.local_class_names,
+                &analysis.imports,
+            )
+            .is_some_and(|name| {
+                matches!(
+                    name.rsplit('.').next(),
+                    Some("property" | "cached_property")
+                )
+            })
+        }),
         return_collection_model: function
             .returns
             .as_deref()
@@ -1085,6 +1117,8 @@ struct CallableSummaryVisitor<'a> {
     imports: &'a HashMap<String, String>,
     local_functions: &'a HashSet<String>,
     parameter_indices: HashMap<String, usize>,
+    bindings: HashMap<String, ParameterOrigin>,
+    collections: HashMap<String, ParameterOrigin>,
     paths: HashSet<CallablePath>,
     calls: Vec<SummaryCall>,
     prefetches: HashMap<usize, SummaryPrefetchState>,
@@ -1092,8 +1126,44 @@ struct CallableSummaryVisitor<'a> {
 
 impl Visitor<'_> for CallableSummaryVisitor<'_> {
     fn visit_stmt(&mut self, statement: &Stmt) {
-        if matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
-            return;
+        match statement {
+            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => return,
+            Stmt::Assign(assign) => {
+                self.visit_expr(&assign.value);
+                if assign.targets.len() == 1 {
+                    self.update_origin_binding(&assign.targets[0], &assign.value);
+                }
+                return;
+            }
+            Stmt::AnnAssign(assign) => {
+                if let Some(value) = &assign.value {
+                    self.visit_expr(value);
+                    self.update_origin_binding(&assign.target, value);
+                }
+                return;
+            }
+            Stmt::For(for_statement) => {
+                self.visit_expr(&for_statement.iter);
+                let origin = iterated_parameter_origin(
+                    &for_statement.iter,
+                    &self.parameter_indices,
+                    &self.bindings,
+                    &self.collections,
+                );
+                let saved_bindings = self.bindings.clone();
+                let saved_collections = self.collections.clone();
+                self.bind_origin(&for_statement.target, origin);
+                for statement in &for_statement.body {
+                    self.visit_stmt(statement);
+                }
+                self.bindings = saved_bindings;
+                self.collections = saved_collections;
+                for statement in &for_statement.orelse {
+                    self.visit_stmt(statement);
+                }
+                return;
+            }
+            _ => {}
         }
         visitor::walk_stmt(self, statement);
     }
@@ -1111,7 +1181,7 @@ impl Visitor<'_> for CallableSummaryVisitor<'_> {
             }
             return;
         }
-        if let Some(origin) = parameter_origin(expression, &self.parameter_indices)
+        if let Some(origin) = parameter_origin(expression, &self.parameter_indices, &self.bindings)
             && !origin.prefix.is_empty()
         {
             if origin
@@ -1128,10 +1198,37 @@ impl Visitor<'_> for CallableSummaryVisitor<'_> {
             return;
         }
 
+        match expression {
+            Expr::ListComp(comprehension) => {
+                self.visit_comprehension(&comprehension.generators, &[comprehension.elt.as_ref()]);
+                return;
+            }
+            Expr::SetComp(comprehension) => {
+                self.visit_comprehension(&comprehension.generators, &[comprehension.elt.as_ref()]);
+                return;
+            }
+            Expr::DictComp(comprehension) => {
+                let mut outputs = Vec::with_capacity(2);
+                if let Some(key) = &comprehension.key {
+                    outputs.push(key.as_ref());
+                }
+                outputs.push(comprehension.value.as_ref());
+                self.visit_comprehension(&comprehension.generators, &outputs);
+                return;
+            }
+            Expr::Generator(comprehension) => {
+                self.visit_comprehension(&comprehension.generators, &[comprehension.elt.as_ref()]);
+                return;
+            }
+            _ => {}
+        }
+
         if let Expr::Call(call) = expression {
             self.record_prefetch_related_objects(call);
             let receiver = match call.func.as_ref() {
-                Expr::Attribute(method) => parameter_origin(&method.value, &self.parameter_indices),
+                Expr::Attribute(method) => {
+                    parameter_origin(&method.value, &self.parameter_indices, &self.bindings)
+                }
                 _ => None,
             };
             let same_class_target = match (call.func.as_ref(), self.class_name) {
@@ -1160,7 +1257,9 @@ impl Visitor<'_> for CallableSummaryVisitor<'_> {
                     .arguments
                     .args
                     .iter()
-                    .map(|argument| parameter_origin(argument, &self.parameter_indices))
+                    .map(|argument| {
+                        parameter_origin(argument, &self.parameter_indices, &self.bindings)
+                    })
                     .collect();
                 let keywords = call
                     .arguments
@@ -1169,7 +1268,11 @@ impl Visitor<'_> for CallableSummaryVisitor<'_> {
                     .filter_map(|keyword| {
                         Some((
                             keyword.arg.as_ref()?.to_string(),
-                            parameter_origin(&keyword.value, &self.parameter_indices)?,
+                            parameter_origin(
+                                &keyword.value,
+                                &self.parameter_indices,
+                                &self.bindings,
+                            )?,
                         ))
                     })
                     .collect();
@@ -1180,6 +1283,17 @@ impl Visitor<'_> for CallableSummaryVisitor<'_> {
                     keywords,
                 });
             }
+
+            if let Expr::Attribute(method) = call.func.as_ref() {
+                self.visit_expr(&method.value);
+                for argument in &call.arguments.args {
+                    self.visit_expr(argument);
+                }
+                for keyword in &call.arguments.keywords {
+                    self.visit_expr(&keyword.value);
+                }
+                return;
+            }
         }
 
         visitor::walk_expr(self, expression);
@@ -1187,6 +1301,60 @@ impl Visitor<'_> for CallableSummaryVisitor<'_> {
 }
 
 impl CallableSummaryVisitor<'_> {
+    fn update_origin_binding(&mut self, target: &Expr, value: &Expr) {
+        let Expr::Name(name) = target else {
+            return;
+        };
+        let collection = iterated_parameter_origin(
+            value,
+            &self.parameter_indices,
+            &self.bindings,
+            &self.collections,
+        );
+        let binding = parameter_origin(value, &self.parameter_indices, &self.bindings);
+        self.bindings.remove(name.id.as_str());
+        self.collections.remove(name.id.as_str());
+        if let Some(origin) = collection {
+            self.collections.insert(name.id.to_string(), origin);
+        } else if let Some(origin) = binding {
+            self.bindings.insert(name.id.to_string(), origin);
+        }
+    }
+
+    fn bind_origin(&mut self, target: &Expr, origin: Option<ParameterOrigin>) {
+        let Expr::Name(name) = target else {
+            return;
+        };
+        self.bindings.remove(name.id.as_str());
+        self.collections.remove(name.id.as_str());
+        if let Some(origin) = origin {
+            self.bindings.insert(name.id.to_string(), origin);
+        }
+    }
+
+    fn visit_comprehension(&mut self, generators: &[ast::Comprehension], outputs: &[&Expr]) {
+        let saved_bindings = self.bindings.clone();
+        let saved_collections = self.collections.clone();
+        for generator in generators {
+            self.visit_expr(&generator.iter);
+            let origin = iterated_parameter_origin(
+                &generator.iter,
+                &self.parameter_indices,
+                &self.bindings,
+                &self.collections,
+            );
+            self.bind_origin(&generator.target, origin);
+            for condition in &generator.ifs {
+                self.visit_expr(condition);
+            }
+        }
+        for output in outputs {
+            self.visit_expr(output);
+        }
+        self.bindings = saved_bindings;
+        self.collections = saved_collections;
+    }
+
     fn record_prefetch_related_objects(&mut self, call: &ast::ExprCall) {
         let Some(target) = qualify_expr(
             &call.func,
@@ -1215,7 +1383,7 @@ impl CallableSummaryVisitor<'_> {
         let parameter_indices = object_expressions
             .iter()
             .filter_map(|expression| {
-                let origin = parameter_origin(expression, &self.parameter_indices)?;
+                let origin = parameter_origin(expression, &self.parameter_indices, &self.bindings)?;
                 origin.prefix.is_empty().then_some(origin.parameter_index)
             })
             .collect::<Vec<_>>();
@@ -1243,6 +1411,7 @@ impl CallableSummaryVisitor<'_> {
 fn parameter_origin(
     expression: &Expr,
     parameter_indices: &HashMap<String, usize>,
+    bindings: &HashMap<String, ParameterOrigin>,
 ) -> Option<ParameterOrigin> {
     let mut current = expression;
     let mut prefix = Vec::new();
@@ -1254,10 +1423,97 @@ fn parameter_origin(
         return None;
     };
     prefix.reverse();
+    if let Some(origin) = bindings.get(root.id.as_str()) {
+        let mut combined = origin.prefix.clone();
+        combined.extend(prefix);
+        return Some(ParameterOrigin {
+            parameter_index: origin.parameter_index,
+            prefix: combined,
+        });
+    }
     Some(ParameterOrigin {
         parameter_index: *parameter_indices.get(root.id.as_str())?,
         prefix,
     })
+}
+
+fn iterated_parameter_origin(
+    expression: &Expr,
+    parameter_indices: &HashMap<String, usize>,
+    bindings: &HashMap<String, ParameterOrigin>,
+    collections: &HashMap<String, ParameterOrigin>,
+) -> Option<ParameterOrigin> {
+    match expression {
+        Expr::Name(name) => collections.get(name.id.as_str()).cloned(),
+        Expr::Call(call)
+            if matches!(call.func.as_ref(), Expr::Name(function) if matches!(function.id.as_str(), "list" | "tuple" | "set" | "iter" | "reversed"))
+                && call.arguments.args.len() == 1
+                && call.arguments.keywords.is_empty() =>
+        {
+            iterated_parameter_origin(
+                &call.arguments.args[0],
+                parameter_indices,
+                bindings,
+                collections,
+            )
+        }
+        Expr::Call(call) => {
+            let Expr::Attribute(method) = call.func.as_ref() else {
+                return None;
+            };
+            parameter_origin(&method.value, parameter_indices, bindings).or_else(|| {
+                iterated_parameter_origin(&method.value, parameter_indices, bindings, collections)
+            })
+        }
+        Expr::Attribute(_) => parameter_origin(expression, parameter_indices, bindings),
+        Expr::ListComp(comprehension) => comprehension_parameter_origin(
+            &comprehension.generators,
+            &comprehension.elt,
+            parameter_indices,
+            bindings,
+            collections,
+        ),
+        Expr::SetComp(comprehension) => comprehension_parameter_origin(
+            &comprehension.generators,
+            &comprehension.elt,
+            parameter_indices,
+            bindings,
+            collections,
+        ),
+        Expr::Generator(comprehension) => comprehension_parameter_origin(
+            &comprehension.generators,
+            &comprehension.elt,
+            parameter_indices,
+            bindings,
+            collections,
+        ),
+        _ => None,
+    }
+}
+
+fn comprehension_parameter_origin(
+    generators: &[ast::Comprehension],
+    output: &Expr,
+    parameter_indices: &HashMap<String, usize>,
+    bindings: &HashMap<String, ParameterOrigin>,
+    collections: &HashMap<String, ParameterOrigin>,
+) -> Option<ParameterOrigin> {
+    let mut local_bindings = bindings.clone();
+    let mut local_collections = collections.clone();
+    for generator in generators {
+        let origin = iterated_parameter_origin(
+            &generator.iter,
+            parameter_indices,
+            &local_bindings,
+            &local_collections,
+        )?;
+        let Expr::Name(target) = &generator.target else {
+            return None;
+        };
+        local_collections.remove(target.id.as_str());
+        local_bindings.insert(target.id.to_string(), origin);
+    }
+    parameter_origin(output, parameter_indices, &local_bindings)
 }
 
 fn relation_write_method(method: &str) -> bool {
