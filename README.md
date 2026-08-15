@@ -90,6 +90,8 @@ bun run serve
 - `DJ001` warnings for missing `select_related()` or `prefetch_related()` across QuerySet loops,
   comprehensions, collected QuerySets, related managers, and helper calls, available through both
   the LSP and `django-lsp check`
+- conservative editor quick fixes that add the missing eager-loading calls to a traced local
+  QuerySet, including a combined fix for multiple relations
 - bounded cross-module call summaries, custom QuerySet chains, collection wrappers, typed model
   parameters, and typed QuerySet-returning functions
 - Django admin display-method awareness, including eager loading declared by `get_queryset()`
