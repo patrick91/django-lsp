@@ -14,6 +14,9 @@ requesting completion at its hidden `<cursor>` marker.
 The menu order is the order returned to the editor. Long menus show the first entries and the number
 of additional results.
 
+Suggestions complete one `__` segment at a time. For example, `au` offers `author`, `author__`
+offers the author's fields and relation lookups, and `author__email__` offers email lookups.
+
 ## Model fields
 
 Completion can begin from a partial field name anywhere inside a supported query call.
