@@ -36,9 +36,8 @@ pub struct CompletionCandidate {
     sort_rank: usize,
 }
 
-// Completions are intentionally query-expression oriented rather than kwarg-name-only.
-// For example, `Blog.objects.filter(ti)` should suggest `title` and `title__icontains`,
-// not just completions after an explicit `=` keyword argument boundary.
+// Complete only the current `__` segment. For example, `Blog.objects.filter(ti)`
+// suggests `title`, and `Blog.objects.filter(title__i)` suggests matching lookups.
 pub fn complete(
     index: &WorkspaceIndex,
     path: &Path,
@@ -214,19 +213,10 @@ fn build_candidates(
                 field.name.as_str(),
                 &context,
             );
-            let mut visited = HashSet::from([current_model.id.clone()]);
-            add_descendant_candidates(
-                &mut output,
-                &context,
-                current_model,
-                &context_chain,
-                0,
-                &mut visited,
-            );
+            add_model_field_candidates(&mut output, &context, current_model);
         }
         None => {
-            let mut visited = HashSet::from([current_model.id.clone()]);
-            add_descendant_candidates(&mut output, &context, current_model, "", 0, &mut visited);
+            add_model_field_candidates(&mut output, &context, current_model);
         }
         Some(_) => {}
     }
@@ -354,53 +344,14 @@ struct RelatedLoadingContext<'a> {
     requested_depth: usize,
 }
 
-fn add_descendant_candidates(
+fn add_model_field_candidates(
     output: &mut CandidateOutput,
     context: &CandidateContext<'_>,
     model: &crate::index::ModelInfo,
-    prefix_chain: &str,
-    relation_depth: usize,
-    visited: &mut HashSet<ModelId>,
 ) {
     for field in &model.fields {
-        let full_path = join_chain(prefix_chain, &field.name);
+        let full_path = join_chain(context.context_chain, &field.name);
         add_field_candidate(output, model, &field.name, &full_path, context);
-
-        if field.related_model.is_some() {
-            add_relation_lookup_candidates(output, &full_path, field.name.as_str(), context);
-
-            if relation_depth >= MAX_COMPLETION_RELATION_DEPTH {
-                continue;
-            }
-
-            let Some(related_model) = field.related_model.as_ref() else {
-                continue;
-            };
-            if !visited.insert(related_model.clone()) {
-                continue;
-            }
-
-            if let Some(next_model) = context.index.model(related_model) {
-                add_descendant_candidates(
-                    output,
-                    context,
-                    next_model,
-                    &full_path,
-                    relation_depth + 1,
-                    visited,
-                );
-            }
-            visited.remove(related_model);
-        } else {
-            add_lookup_candidates(
-                output,
-                &full_path,
-                field.supported_lookups,
-                field.name.as_str(),
-                false,
-                context,
-            );
-        }
     }
 }
 
@@ -779,8 +730,7 @@ Blog.objects.filter(ti)
         let cursor = source.find("ti)").unwrap() + 2;
         let items = complete(&index, &dir.path().join("blog/views.py"), &source, cursor);
         let labels = labels(items);
-        assert!(labels.contains(&"title".to_string()));
-        assert!(labels.contains(&"icontains".to_string()));
+        assert_eq!(labels, ["title"]);
     }
 
     #[test]
@@ -849,6 +799,7 @@ Blog.objects.filter(author__)
         let source = fs::read_to_string(dir.path().join("blog/views.py")).unwrap();
         let cursor = source.find("author__)").unwrap() + "author__".len();
         let items = complete(&index, &dir.path().join("blog/views.py"), &source, cursor);
+        assert!(items.iter().all(|item| !item.insert_text.contains("__")));
         let labels = labels(items);
         assert!(labels.contains(&"email".to_string()));
         assert!(labels.contains(&"team".to_string()));
@@ -892,7 +843,7 @@ Blog.objects.filter(author__team__name__i)
     }
 
     #[test]
-    fn completes_root_prefix_with_descendant_paths() {
+    fn completes_root_fields_without_descendant_paths() {
         let (dir, index) = fixture_index(&[
             (
                 "blog/models.py",
@@ -920,20 +871,21 @@ Blog.objects.filter(au)
             ),
         ]);
 
-        let source = fs::read_to_string(dir.path().join("blog/views.py")).unwrap();
-        let cursor = source.find("au)").unwrap() + 2;
-        let items = complete_lsp_items(&index, &dir.path().join("blog/views.py"), &source, cursor);
-        let labels = items.into_iter().map(|item| item.label).collect::<Vec<_>>();
+        let path = dir.path().join("blog/views.py");
+        for method in ["filter", "exclude", "get"] {
+            for token in ["", "a", "au", "author"] {
+                let source = format!("from .models import Blog\n\nBlog.objects.{method}({token})");
+                let cursor = source.len() - 1;
+                let items = complete_lsp_items(&index, &path, &source, cursor);
+                let labels = items.into_iter().map(|item| item.label).collect::<Vec<_>>();
 
-        assert!(labels.contains(&"author".to_string()));
-        assert!(labels.contains(&"author__email".to_string()));
-        assert!(labels.contains(&"author__team".to_string()));
-        assert!(labels.contains(&"author__team__name".to_string()));
-        assert!(labels.contains(&"author__email__icontains".to_string()));
+                assert_eq!(labels, ["author"], "{method}({token})");
+            }
+        }
     }
 
     #[test]
-    fn descendant_paths_insert_only_missing_suffix() {
+    fn relation_fields_insert_only_the_current_segment() {
         let (dir, index) = fixture_index(&[
             (
                 "blog/models.py",
@@ -963,16 +915,47 @@ Blog.objects.filter(author__te)
         let source = fs::read_to_string(dir.path().join("blog/views.py")).unwrap();
         let cursor = source.find("__te)").unwrap() + 4;
         let items = complete_lsp_items(&index, &dir.path().join("blog/views.py"), &source, cursor);
-        let team_name = items
-            .into_iter()
-            .find(|item| item.label == "author__team__name")
-            .unwrap();
+        assert_eq!(items.len(), 1);
+        let team = items.into_iter().next().unwrap();
+        assert_eq!(team.label, "author__team");
+        assert_eq!(team.filter_text.as_deref(), Some("author__team"));
 
-        let edit = match team_name.text_edit.unwrap() {
+        let edit = match team.text_edit.unwrap() {
             CompletionTextEdit::Edit(edit) => edit,
             CompletionTextEdit::InsertAndReplace(_) => panic!("unexpected insert-and-replace edit"),
         };
-        assert_eq!(edit.new_text, "team__name");
+        assert_eq!(edit.new_text, "team");
+        assert_eq!(edit.range, offsets_to_range(&source, cursor - 2, cursor));
+    }
+
+    #[test]
+    fn completes_recursive_relations_one_segment_at_a_time() {
+        let (dir, index) = fixture_index(&[(
+            "blog/models.py",
+            r#"
+from django.db import models
+
+class Category(models.Model):
+    name = models.CharField(max_length=64)
+    parent = models.ForeignKey("self", on_delete=models.CASCADE, related_name="children")
+"#,
+        )]);
+        let path = dir.path().join("blog/views.py");
+
+        for (token, expected) in [
+            ("parent__pa", "parent__parent"),
+            ("children__na", "children__name"),
+            (
+                "parent__parent__parent__parent__na",
+                "parent__parent__parent__parent__name",
+            ),
+        ] {
+            let source = format!("from .models import Category\nCategory.objects.filter({token})");
+            let items = complete_lsp_items(&index, &path, &source, source.len() - 1);
+            let labels = items.into_iter().map(|item| item.label).collect::<Vec<_>>();
+
+            assert_eq!(labels, [expected], "{token}");
+        }
     }
 
     #[test]

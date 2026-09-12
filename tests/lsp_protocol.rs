@@ -114,7 +114,7 @@ async fn completes_a_django_project_over_json_rpc() {
         .finish();
     let response = send(&mut service, author_completion).await.unwrap();
     let labels = completion_labels(&response);
-    assert!(labels.contains(&"author__team"));
+    assert_eq!(labels, ["author__team"]);
     let team = response
         .result()
         .unwrap()
@@ -124,6 +124,16 @@ async fn completes_a_django_project_over_json_rpc() {
         .find(|item| item["label"] == "author__team")
         .unwrap();
     assert_eq!(team["textEdit"]["newText"], "team");
+
+    let root_completion = Request::build("textDocument/completion")
+        .params(json!({
+            "textDocument": {"uri": views_uri},
+            "position": position_after(&views_source, "Blog.objects.filter(a"),
+        }))
+        .id(8)
+        .finish();
+    let response = send(&mut service, root_completion).await.unwrap();
+    assert_eq!(completion_labels(&response), ["author"]);
 
     let user_completion = Request::build("textDocument/completion")
         .params(json!({
