@@ -31,6 +31,7 @@ const GENERIC_LOOKUPS: &[&str] = &[
 const RELATION_FIELD_NAMES: &[&str] = &["ForeignKey", "OneToOneField", "ManyToManyField"];
 const DJANGO_MODEL_BASES: &[&str] = &[
     "django.db.models.Model",
+    "django.contrib.gis.db.models.Model",
     "django.contrib.auth.models.AbstractUser",
     "django.contrib.auth.base_user.AbstractBaseUser",
     "model_utils.models.StatusModel",
