@@ -929,6 +929,58 @@ Blog.objects.filter(author__te)
     }
 
     #[test]
+    fn completes_geodjango_models() {
+        for (imports, base) in [
+            ("from django.contrib.gis.db import models", "models.Model"),
+            (
+                "import django.contrib.gis.db.models as models",
+                "models.Model",
+            ),
+            (
+                "from django.contrib.gis.db import models\nfrom django.contrib.gis.db.models import Model as GeoModel",
+                "GeoModel",
+            ),
+            (
+                "from django.contrib.gis.db import models\nimport django.contrib.gis.db.models",
+                "django.contrib.gis.db.models.Model",
+            ),
+        ] {
+            let source = format!(
+                r#"
+{imports}
+
+class Region({base}):
+    name = models.CharField(max_length=64)
+    boundary = models.PolygonField()
+
+class Place({base}):
+    location = models.PointField()
+    region = models.ForeignKey(Region, on_delete=models.CASCADE)
+
+class Landmark(Place):
+    entrance = models.PointField()
+"#
+            );
+            let (dir, index) = fixture_index(&[("places/models.py", &source)]);
+            let path = dir.path().join("places/views.py");
+
+            for (model, token, expected) in [
+                ("Region", "na", "name"),
+                ("Region", "bo", "boundary"),
+                ("Place", "lo", "location"),
+                ("Place", "region__na", "region__name"),
+                ("Landmark", "en", "entrance"),
+            ] {
+                let source =
+                    format!("from .models import {model}\n{model}.objects.filter({token})");
+                let items = complete_lsp_items(&index, &path, &source, source.len() - 1);
+                let labels = items.into_iter().map(|item| item.label).collect::<Vec<_>>();
+                assert_eq!(labels, [expected], "{imports}: {model}({token})");
+            }
+        }
+    }
+
+    #[test]
     fn completes_recursive_relations_one_segment_at_a_time() {
         let (dir, index) = fixture_index(&[(
             "blog/models.py",
